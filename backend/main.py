@@ -36,6 +36,11 @@ class MergeRequest(BaseModel):
     output_filename: str = "merged.pdf"
 
 
+class CropPagesRequest(BaseModel):
+    file_id: str
+    pages_to_delete: List[int]  # 0-indexed
+
+
 def _remove_file(path: str) -> None:
     try:
         if os.path.exists(path):
@@ -133,6 +138,63 @@ async def get_thumbnail(file_id: str, page: int = 0, width: int = 200):
         media_type="image/png",
         # Allow browser/CDN caching for 1 hour; file content is immutable per file_id+page
         headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/api/files/{file_id}/download")
+async def download_file(file_id: str):
+    if file_id not in file_registry:
+        raise HTTPException(status_code=404, detail="File not found")
+    meta = file_registry[file_id]
+    if not os.path.exists(meta["path"]):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+    return FileResponse(
+        meta["path"],
+        media_type="application/pdf",
+        filename=meta["filename"],
+        headers={"Content-Disposition": f'attachment; filename="{meta["filename"]}"'},
+    )
+
+
+@app.post("/api/crop-pages")
+async def crop_pages(request: CropPagesRequest, background_tasks: BackgroundTasks):
+    if request.file_id not in file_registry:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    meta = file_registry[request.file_id]
+    if not os.path.exists(meta["path"]):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    doc = fitz.open(meta["path"])
+    total = len(doc)
+
+    pages_to_delete = sorted(set(request.pages_to_delete), reverse=True)
+    for p in pages_to_delete:
+        if p < 0 or p >= total:
+            doc.close()
+            raise HTTPException(status_code=400, detail=f"Invalid page index: {p}")
+
+    if len(pages_to_delete) >= total:
+        doc.close()
+        raise HTTPException(status_code=400, detail="Cannot delete all pages from the document")
+
+    for p in pages_to_delete:
+        doc.delete_page(p)
+
+    output_id = str(uuid.uuid4())
+    output_path = os.path.join(TEMP_DIR, f"output_{output_id}.pdf")
+    doc.save(output_path)
+    doc.close()
+
+    base_name = os.path.splitext(meta["filename"])[0]
+    download_name = f"{base_name}_cropped.pdf"
+
+    background_tasks.add_task(_remove_file, output_path)
+    return FileResponse(
+        output_path,
+        media_type="application/pdf",
+        filename=download_name,
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
     )
 
 

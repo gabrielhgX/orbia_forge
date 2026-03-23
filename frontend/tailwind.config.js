@@ -31,33 +31,41 @@ module.exports = {
       keyframes: {
         fadeIn: {
           from: { opacity: "0" },
-          to: { opacity: "1" },
+          to:   { opacity: "1" },
         },
         slideUp: {
           from: { opacity: "0", transform: "translateY(14px)" },
-          to: { opacity: "1", transform: "translateY(0)" },
+          to:   { opacity: "1", transform: "translateY(0)" },
         },
         toastIn: {
           from: { opacity: "0", transform: "translateY(16px) scale(0.97)" },
-          to: { opacity: "1", transform: "translateY(0) scale(1)" },
+          to:   { opacity: "1", transform: "translateY(0) scale(1)" },
         },
-        // Workspace panel slides in from slightly above when a PDF is dropped
+        // Mini-window entry: panel slides in from slightly above on drop.
+        // Kept fast (0.28 s) so the total window + pages ≤ 2 s.
         panelEntry: {
-          from: { opacity: "0", transform: "translateY(-18px) scale(0.97)" },
-          to: { opacity: "1", transform: "translateY(0) scale(1)" },
+          from: { opacity: "0", transform: "translateY(-14px) scale(0.98)" },
+          to:   { opacity: "1", transform: "translateY(0) scale(1)" },
         },
-        // Individual page thumbnails reveal sequentially (stagger via animationDelay)
+        // Page thumbnails reveal sequentially via JS animationDelay stagger.
+        // Each page takes 0.2 s; stagger is capped at 380 ms → total ≤ 0.58 s.
         pageReveal: {
-          from: { opacity: "0", transform: "translateY(-10px)" },
-          to: { opacity: "1", transform: "translateY(0)" },
+          from: { opacity: "0", transform: "translateY(-8px)" },
+          to:   { opacity: "1", transform: "translateY(0)" },
+        },
+        // Sub-tool list inside the retractable ToolsPanel slides down.
+        toolsSlide: {
+          from: { opacity: "0", transform: "translateY(-5px)" },
+          to:   { opacity: "1", transform: "translateY(0)" },
         },
       },
       animation: {
-        fadeIn: "fadeIn 0.2s ease-out",
-        slideUp: "slideUp 0.25s cubic-bezier(0.16,1,0.3,1)",
-        toastIn: "toastIn 0.3s cubic-bezier(0.16,1,0.3,1)",
-        panelEntry: "panelEntry 0.35s cubic-bezier(0.16,1,0.3,1)",
-        pageReveal: "pageReveal 0.25s ease-out both",
+        fadeIn:     "fadeIn 0.18s ease-out",
+        slideUp:    "slideUp 0.25s cubic-bezier(0.16,1,0.3,1)",
+        toastIn:    "toastIn 0.3s cubic-bezier(0.16,1,0.3,1)",
+        panelEntry: "panelEntry 0.28s cubic-bezier(0.16,1,0.3,1)",
+        pageReveal: "pageReveal 0.2s ease-out both",
+        toolsSlide: "toolsSlide 0.15s ease-out",
       },
     },
   },

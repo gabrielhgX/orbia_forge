@@ -74,6 +74,28 @@ export async function splitPdf(fileId, startPage, endPage) {
   }
 }
 
+export async function downloadFile(fileId) {
+  try {
+    const res = await api.get(`/api/files/${fileId}/download`, { responseType: "blob" });
+    triggerDownload(res.data, res.headers["content-disposition"], "download.pdf");
+  } catch (err) {
+    throw new Error(await parseBlobError(err));
+  }
+}
+
+export async function cropPages(fileId, pagesToDelete) {
+  try {
+    const res = await api.post(
+      "/api/crop-pages",
+      { file_id: fileId, pages_to_delete: pagesToDelete },
+      { responseType: "blob" }
+    );
+    triggerDownload(res.data, res.headers["content-disposition"], "cropped.pdf");
+  } catch (err) {
+    throw new Error(await parseBlobError(err));
+  }
+}
+
 export async function mergePdfs(fileIds, outputFilename = "merged.pdf") {
   try {
     const res = await api.post(
