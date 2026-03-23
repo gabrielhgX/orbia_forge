@@ -9,7 +9,11 @@ import Workspace from "./components/Workspace";
 export default function App() {
   const [files, setFiles] = useState([]);
   const [workspaceFiles, setWorkspaceFiles] = useState([]);
+
+  // Tracks which file is currently being dragged FROM the sidebar → workspace
   const [draggedFile, setDraggedFile] = useState(null);
+  // Tracks which workspace panel is currently being dragged → sidebar (to restore)
+  const [draggedWorkspaceFile, setDraggedWorkspaceFile] = useState(null);
 
   const [showSplitModal, setShowSplitModal] = useState(false);
   const [splitTarget, setSplitTarget] = useState(null);
@@ -68,7 +72,7 @@ export default function App() {
     [addToast]
   );
 
-  // ── workspace DnD ──────────────────────────────────────────────────────────
+  // ── sidebar → workspace drag ───────────────────────────────────────────────
   const handleDragStart = useCallback((file) => setDraggedFile(file), []);
 
   const handleDropToWorkspace = useCallback((file) => {
@@ -80,6 +84,25 @@ export default function App() {
 
   const handleRemoveFromWorkspace = useCallback((fileId) => {
     setWorkspaceFiles((prev) => prev.filter((f) => f.file_id !== fileId));
+  }, []);
+
+  // ── workspace panel → sidebar drag (restore) ───────────────────────────────
+  // Called when the user starts dragging a workspace panel header
+  const handleDragStartFromWorkspace = useCallback((file) => {
+    setDraggedWorkspaceFile(file);
+  }, []);
+
+  // Called when a workspace-panel drag ends WITHOUT completing a drop on the sidebar
+  // (e.g. user cancelled the drag). Clears the hint indicator in the sidebar.
+  const handleDragEndFromWorkspace = useCallback(() => {
+    setDraggedWorkspaceFile(null);
+  }, []);
+
+  // Called when the user drops a workspace panel onto the sidebar.
+  // Removes the panel from the workspace (the card remains in the library).
+  const handleDropToSidebar = useCallback((file) => {
+    setDraggedWorkspaceFile(null);
+    setWorkspaceFiles((prev) => prev.filter((f) => f.file_id !== file.file_id));
   }, []);
 
   // ── split ──────────────────────────────────────────────────────────────────
@@ -130,6 +153,10 @@ export default function App() {
         onDelete={handleDelete}
         onDragStart={handleDragStart}
         loading={loading}
+        // Workspace-restore props: enable sidebar to act as a drop target
+        // when the user drags a workspace panel back to the sidebar
+        draggedWorkspaceFile={draggedWorkspaceFile}
+        onDropFromWorkspace={handleDropToSidebar}
       />
 
       <Workspace
@@ -139,6 +166,10 @@ export default function App() {
         onRemove={handleRemoveFromWorkspace}
         onSplit={openSplit}
         onMerge={() => setShowMergeModal(true)}
+        // Workspace-restore props: track panel drags so the sidebar
+        // can show a "drop here" hint and accept the drop
+        onDragStartFromWorkspace={handleDragStartFromWorkspace}
+        onDragEndFromWorkspace={handleDragEndFromWorkspace}
       />
 
       {showSplitModal && splitTarget && (

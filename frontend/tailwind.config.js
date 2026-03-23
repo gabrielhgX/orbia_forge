@@ -41,11 +41,23 @@ module.exports = {
           from: { opacity: "0", transform: "translateY(16px) scale(0.97)" },
           to: { opacity: "1", transform: "translateY(0) scale(1)" },
         },
+        // Workspace panel slides in from slightly above when a PDF is dropped
+        panelEntry: {
+          from: { opacity: "0", transform: "translateY(-18px) scale(0.97)" },
+          to: { opacity: "1", transform: "translateY(0) scale(1)" },
+        },
+        // Individual page thumbnails reveal sequentially (stagger via animationDelay)
+        pageReveal: {
+          from: { opacity: "0", transform: "translateY(-10px)" },
+          to: { opacity: "1", transform: "translateY(0)" },
+        },
       },
       animation: {
         fadeIn: "fadeIn 0.2s ease-out",
         slideUp: "slideUp 0.25s cubic-bezier(0.16,1,0.3,1)",
         toastIn: "toastIn 0.3s cubic-bezier(0.16,1,0.3,1)",
+        panelEntry: "panelEntry 0.35s cubic-bezier(0.16,1,0.3,1)",
+        pageReveal: "pageReveal 0.25s ease-out both",
       },
     },
   },

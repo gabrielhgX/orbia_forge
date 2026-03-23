@@ -5,7 +5,7 @@ from typing import Dict, List
 import fitz  # PyMuPDF
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 app = FastAPI(title="PDF Tool API")
@@ -97,6 +97,43 @@ async def delete_file(file_id: str):
     meta = file_registry.pop(file_id)
     _remove_file(meta["path"])
     return {"status": "deleted", "file_id": file_id}
+
+
+@app.get("/api/files/{file_id}/thumbnail")
+async def get_thumbnail(file_id: str, page: int = 0, width: int = 200):
+    """
+    Render a single PDF page as a PNG thumbnail.
+    - page: 0-indexed page number (default 0 = first page)
+    - width: output pixel width; height is scaled to preserve aspect ratio
+    """
+    if file_id not in file_registry:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    meta = file_registry[file_id]
+    if not os.path.exists(meta["path"]):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    doc = fitz.open(meta["path"])
+    if page < 0 or page >= len(doc):
+        doc.close()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid page. Document has {len(doc)} page(s); use 0-based index.",
+        )
+
+    pg = doc[page]
+    scale = width / pg.rect.width
+    mat = fitz.Matrix(scale, scale)
+    pix = pg.get_pixmap(matrix=mat, alpha=False)
+    png_bytes = pix.tobytes("png")
+    doc.close()
+
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        # Allow browser/CDN caching for 1 hour; file content is immutable per file_id+page
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @app.post("/api/split")
