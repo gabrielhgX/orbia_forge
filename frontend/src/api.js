@@ -47,6 +47,13 @@ export async function uploadFile(file) {
   return data;
 }
 
+export async function uploadPdfBlob(pdfBlob, filename = "merged.pdf") {
+  const fd = new FormData();
+  fd.append("file", new File([pdfBlob], filename, { type: "application/pdf" }));
+  const { data } = await api.post("/api/upload", fd);
+  return data;
+}
+
 export async function listFiles() {
   const { data } = await api.get("/api/files");
   return data;
@@ -96,6 +103,19 @@ export async function cropPages(fileId, pagesToDelete) {
   }
 }
 
+export async function reorderPages(fileId, pageOrder) {
+  try {
+    const res = await api.post(
+      "/api/reorder",
+      { file_id: fileId, page_order: pageOrder },
+      { responseType: "blob" }
+    );
+    triggerDownload(res.data, res.headers["content-disposition"], "reordered.pdf");
+  } catch (err) {
+    throw new Error(await parseBlobError(err));
+  }
+}
+
 export async function mergePdfs(fileIds, outputFilename = "merged.pdf") {
   try {
     const res = await api.post(
@@ -106,5 +126,17 @@ export async function mergePdfs(fileIds, outputFilename = "merged.pdf") {
     triggerDownload(res.data, res.headers["content-disposition"], outputFilename);
   } catch (err) {
     throw new Error(await parseBlobError(err));
+  }
+}
+
+export async function mergePages(pages, outputFilename = "merged.pdf") {
+  try {
+    const { data } = await api.post("/api/merge-pages", {
+      pages: pages.map((p) => ({ file_id: p.fileId, page_index: p.pageIndex })),
+      output_filename: outputFilename,
+    });
+    return data; // { file_id, filename, page_count, size }
+  } catch (err) {
+    throw new Error(err?.response?.data?.detail || err.message || "Operation failed");
   }
 }

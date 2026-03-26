@@ -36,9 +36,24 @@ class MergeRequest(BaseModel):
     output_filename: str = "merged.pdf"
 
 
+class MergePageRef(BaseModel):
+    file_id: str
+    page_index: int  # 0-indexed
+
+
+class MergePagesRequest(BaseModel):
+    pages: List[MergePageRef]
+    output_filename: str = "merged.pdf"
+
+
 class CropPagesRequest(BaseModel):
     file_id: str
     pages_to_delete: List[int]  # 0-indexed
+
+
+class ReorderRequest(BaseModel):
+    file_id: str
+    page_order: List[int]  # 0-indexed original page numbers in desired display order
 
 
 def _remove_file(path: str) -> None:
@@ -188,6 +203,118 @@ async def crop_pages(request: CropPagesRequest, background_tasks: BackgroundTask
 
     base_name = os.path.splitext(meta["filename"])[0]
     download_name = f"{base_name}_cropped.pdf"
+
+    background_tasks.add_task(_remove_file, output_path)
+    return FileResponse(
+        output_path,
+        media_type="application/pdf",
+        filename=download_name,
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
+
+
+@app.post("/api/merge-pages")
+async def merge_pages(request: MergePagesRequest):
+    if not request.pages:
+        raise HTTPException(status_code=400, detail="pages cannot be empty")
+
+    print("Generating PDF with pages:", [(p.file_id, p.page_index) for p in request.pages])
+
+    merged = fitz.open()
+
+    opened_docs: Dict[str, fitz.Document] = {}
+    try:
+        for ref in request.pages:
+            if ref.file_id not in file_registry:
+                raise HTTPException(status_code=404, detail=f"File '{ref.file_id}' not found")
+
+            meta = file_registry[ref.file_id]
+            if not os.path.exists(meta["path"]):
+                raise HTTPException(status_code=404, detail=f"File '{meta['filename']}' not found on disk")
+
+            doc = opened_docs.get(ref.file_id)
+            if doc is None:
+                doc = fitz.open(meta["path"])
+                opened_docs[ref.file_id] = doc
+
+            if ref.page_index < 0 or ref.page_index >= len(doc):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid page index {ref.page_index} for file '{ref.file_id}'",
+                )
+
+            merged.insert_pdf(doc, from_page=ref.page_index, to_page=ref.page_index)
+    finally:
+        for doc in opened_docs.values():
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+    file_id = str(uuid.uuid4())
+    filename = (
+        request.output_filename
+        if request.output_filename.endswith(".pdf")
+        else request.output_filename + ".pdf"
+    )
+    file_path = os.path.join(TEMP_DIR, f"{file_id}.pdf")
+    page_count = len(merged)
+    merged.save(file_path)
+    merged.close()
+
+    size = os.path.getsize(file_path)
+    metadata = {
+        "file_id": file_id,
+        "filename": filename,
+        "page_count": page_count,
+        "size": size,
+        "path": file_path,
+    }
+    file_registry[file_id] = metadata
+
+    print(f"Generated PDF: file_id={file_id}, pages={page_count}")
+
+    return {k: v for k, v in metadata.items() if k != "path"}
+
+
+@app.post("/api/reorder")
+async def reorder_pages(request: ReorderRequest, background_tasks: BackgroundTasks):
+    """Return a new PDF whose pages follow the requested order.
+
+    page_order is a list of 0-based original page indices, e.g. [0, 2, 1, 3]
+    means the output PDF has the original pages in that sequence.
+    """
+    if request.file_id not in file_registry:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    meta = file_registry[request.file_id]
+    if not os.path.exists(meta["path"]):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    doc = fitz.open(meta["path"])
+    total = len(doc)
+
+    if not request.page_order:
+        doc.close()
+        raise HTTPException(status_code=400, detail="page_order cannot be empty")
+
+    for p in request.page_order:
+        if p < 0 or p >= total:
+            doc.close()
+            raise HTTPException(status_code=400, detail=f"Invalid page index: {p}")
+
+    new_doc = fitz.open()
+    for p in request.page_order:
+        new_doc.insert_pdf(doc, from_page=p, to_page=p)
+
+    output_id = str(uuid.uuid4())
+    output_path = os.path.join(TEMP_DIR, f"output_{output_id}.pdf")
+    new_doc.save(output_path)
+    new_doc.close()
+    doc.close()
+
+    base_name = os.path.splitext(meta["filename"])[0]
+    download_name = f"{base_name}_reordered.pdf"
 
     background_tasks.add_task(_remove_file, output_path)
     return FileResponse(

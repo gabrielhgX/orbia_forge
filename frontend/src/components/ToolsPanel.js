@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, GitMerge, Maximize2, Scissors } from "lucide-react";
+import { ChevronDown, ChevronRight, Maximize2, Scissors } from "lucide-react";
 import React, { useState } from "react";
 
 // ── Tool registry ─────────────────────────────────────────────────────────────
@@ -13,11 +13,11 @@ const TOOL_DEFS = [
     autoOpen: true,   // sub-tools open automatically when the panel is hovered
     subTools: [
       {
-        id:          "page-crop",
+        id:          "page-cut",
         icon:        Scissors,
-        label:       "Page crop",
-        description: "Click pages to mark them for deletion",
-        action:      "pageCrop",
+        label:       "Page Cut",
+        description: "Click a page to remove it instantly",
+        action:      "pageCut",
       },
       {
         id:          "area-crop",
@@ -25,21 +25,6 @@ const TOOL_DEFS = [
         label:       "Area crop",
         description: "Crop a region from a page",
         comingSoon:  true,
-      },
-    ],
-  },
-  {
-    id:       "merge",
-    icon:     GitMerge,
-    label:    "Merge PDFs",
-    accentBg: "bg-blue-500",
-    subTools: [
-      {
-        id:          "merge-all",
-        icon:        GitMerge,
-        label:       "Merge all open",
-        description: "Combine all workspace PDFs into one",
-        action:      "merge",
       },
     ],
   },
@@ -61,10 +46,12 @@ export default function ToolsPanel({
   files,
   selectedFile,
   pageCropMode,
+  scissorsFileId,
   onSplit,
-  onMerge,
   onActivatePageCrop,
   onCancelCrop,
+  onActivateScissors,
+  onDeactivateScissors,
 }) {
   const [expanded,   setExpanded]   = useState(false);
   const [openToolId, setOpenToolId] = useState(null);
@@ -75,14 +62,18 @@ export default function ToolsPanel({
       if (pageCropMode) onCancelCrop();
       else onActivatePageCrop();
     }
-    if (action === "merge"    && files.length >= 2) onMerge();
+    if (action === "pageCut" && selectedFile) {
+      const isActive = scissorsFileId === selectedFile.file_id;
+      if (isActive) onDeactivateScissors();
+      else onActivateScissors(selectedFile.file_id);
+    }
   };
 
   // ── Sub-tool availability ────────────────────────────────────────────────
   const isEnabled = (subTool) => {
-    if (subTool.comingSoon)                   return false;
-    if (subTool.action === "pageCrop")        return !!selectedFile;
-    if (subTool.action === "merge")           return files.length >= 2;
+    if (subTool.comingSoon)            return false;
+    if (subTool.action === "pageCrop") return !!selectedFile;
+    if (subTool.action === "pageCut")  return !!selectedFile;
     return true;
   };
 
@@ -185,6 +176,10 @@ export default function ToolsPanel({
                     const isCropActive =
                       sub.action === "pageCrop" && pageCropMode && selectedFile &&
                       pageCropMode.fileId === selectedFile.file_id;
+                    const isCutActive =
+                      sub.action === "pageCut" && selectedFile &&
+                      scissorsFileId === selectedFile.file_id;
+                    const isActive = isCropActive || isCutActive;
 
                     return (
                       <button
@@ -194,20 +189,20 @@ export default function ToolsPanel({
                         className={`w-full flex items-start gap-2.5 pl-10 pr-4 py-2 text-left
                           transition-colors duration-150
                           ${enabled
-                            ? isCropActive
-                              ? "bg-red-50 hover:bg-red-100 cursor-pointer"
+                            ? isActive
+                              ? "bg-orange-50 hover:bg-orange-100 cursor-pointer"
                               : "hover:bg-gray-50 cursor-pointer"
                             : "opacity-50 cursor-not-allowed"
                           }`}
                       >
                         <SubIcon size={13}
-                          className={`flex-shrink-0 mt-0.5 ${isCropActive ? "text-red-500" : "text-apple-secondary"}`}
+                          className={`flex-shrink-0 mt-0.5 ${isActive ? "text-orange-500" : "text-apple-secondary"}`}
                         />
                         <div className="min-w-0 overflow-hidden">
                           <p className={`text-[12px] font-medium leading-tight
                             flex items-center gap-1.5 whitespace-nowrap
-                            ${isCropActive ? "text-red-600" : "text-apple-text"}`}>
-                            {isCropActive ? "Exit crop mode" : sub.label}
+                            ${isActive ? "text-orange-600" : "text-apple-text"}`}>
+                            {isCutActive ? "Stop cutting" : isCropActive ? "Exit crop mode" : sub.label}
                             {sub.comingSoon && (
                               <span className="text-[9px] font-bold bg-gray-100
                                 text-apple-secondary px-1 py-0.5 rounded whitespace-nowrap">
@@ -217,11 +212,13 @@ export default function ToolsPanel({
                           </p>
                           <p className="text-[10px] text-apple-secondary mt-0.5
                             leading-tight whitespace-nowrap">
-                            {isCropActive
-                              ? "Click to cancel crop mode"
-                              : !enabled && sub.action === "pageCrop"
-                                ? "Select a panel first"
-                                : sub.description}
+                            {isCutActive
+                              ? "Click to exit scissors mode"
+                              : isCropActive
+                                ? "Click to cancel crop mode"
+                                : !enabled && (sub.action === "pageCrop" || sub.action === "pageCut")
+                                  ? "Select a panel first"
+                                  : sub.description}
                           </p>
                         </div>
                       </button>

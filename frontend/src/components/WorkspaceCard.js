@@ -1,61 +1,102 @@
-import { FileText, GripVertical, X } from "lucide-react";
+import { FileText, GripVertical, Scissors, X } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
 import { BACKEND_BASE_URL } from "../api";
 
 /**
  * PageThumbnail — one page cell inside a WorkspaceCard panel.
  *
- * In normal mode: clicking opens ExpandedPageView.
- * In crop mode:   clicking toggles the page's deletion mark (red overlay).
+ * Dragging anywhere on the thumbnail starts the cross-panel / extract drag
+ * (handled by Workspace.js). Within-panel reorder, cross-panel move, and
+ * extract-to-new-panel are all resolved on mouseup in Workspace.js.
  */
 function PageThumbnail({
   fileId,
   pageIdx,
+  displayIdx,
   totalPages,
   onPageClick,
   isCropMode,
   isMarked,
   onToggleMark,
+  thumbnailWidth,
+  isScissorsMode,
+  onCutPage,
+  isCutConfirmOpen,
+  onCancelCut,
+  onExternalDragStart,
+  isBeingDragged,
+  onRegisterEl,
 }) {
   const [thumbErr, setThumbErr] = useState(false);
+  const outerRef = useRef(null);
 
+  const snappedWidth = Math.max(280, Math.round(thumbnailWidth / 50) * 50);
   const thumbnailUrl =
-    `${BACKEND_BASE_URL}/api/files/${fileId}/thumbnail?page=${pageIdx}&width=280`;
+    `${BACKEND_BASE_URL}/api/files/${fileId}/thumbnail?page=${pageIdx}&width=${snappedWidth}`;
 
-  const handleClick = () => {
+  const handleClick = (e) => {
+    if (isScissorsMode) { e.stopPropagation(); onCutPage(pageIdx); return; }
     if (isCropMode) onToggleMark(pageIdx);
-    else onPageClick(pageIdx);
+  };
+
+  const handleDoubleClick = () => {
+    if (!isCropMode && !isScissorsMode) onPageClick(pageIdx);
   };
 
   return (
     <div
+      ref={(el) => {
+        outerRef.current = el;
+        onRegisterEl?.(el);
+      }}
       onClick={handleClick}
-      style={{ animationDelay: `${Math.min(pageIdx * 40, 380)}ms` }}
-      className={`relative overflow-hidden rounded-lg border-2
+      onDoubleClick={handleDoubleClick}
+      onMouseDown={(e) => {
+        // Only start drag in normal mode, on left button, not from inner buttons
+        if (isCropMode || isScissorsMode) return;
+        if (e.button !== 0) return;
+        if (e.target.closest("button")) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onExternalDragStart?.({
+          rect: outerRef.current?.getBoundingClientRect() || null,
+          x: e.clientX,
+          y: e.clientY,
+        });
+      }}
+      style={{ animationDelay: `${Math.min(displayIdx * 40, 380)}ms` }}
+      className={`group relative overflow-hidden rounded-lg border-2
         animate-pageReveal transition-all duration-150
-        ${isCropMode
-          ? isMarked
-            ? "border-red-500 cursor-pointer"
-            : "border-transparent hover:border-red-300 cursor-pointer"
-          : "border-transparent hover:border-apple-blue/50 cursor-pointer hover:shadow-[0_3px_14px_rgba(0,113,227,0.18)]"
+        ${isBeingDragged
+          ? "opacity-25 border-apple-blue/40"
+          : isScissorsMode
+            ? "border-transparent hover:border-red-400 cursor-crosshair"
+            : isCropMode
+              ? isMarked
+                ? "border-red-500 cursor-pointer"
+                : "border-transparent hover:border-red-300 cursor-pointer"
+              : "border-transparent hover:border-apple-blue/50 cursor-grab active:cursor-grabbing hover:shadow-[0_3px_14px_rgba(0,113,227,0.18)]"
         }`}
       title={
-        isCropMode
-          ? isMarked ? "Click to unmark" : "Click to mark for deletion"
-          : `Page ${pageIdx + 1} — click to view`
+        isBeingDragged
+          ? undefined
+          : isScissorsMode
+            ? `Cut page ${displayIdx + 1}`
+            : isCropMode
+              ? isMarked ? "Click to unmark" : "Click to mark for deletion"
+              : `Page ${displayIdx + 1} — drag to move · double-click to view`
       }
     >
-      {/* Page image or fallback */}
       <div className="bg-gray-100 flex items-center justify-center min-h-[130px]">
         {thumbErr ? (
           <div className="flex flex-col items-center gap-2 py-8 text-apple-secondary">
             <FileText size={24} className="text-apple-border" />
-            <span className="text-[11px]">Page {pageIdx + 1}</span>
+            <span className="text-[11px]">Page {displayIdx + 1}</span>
           </div>
         ) : (
           <img
             src={thumbnailUrl}
-            alt={`Page ${pageIdx + 1} of ${totalPages}`}
+            alt={`Page ${displayIdx + 1} of ${totalPages}`}
             className="w-full block"
             onError={() => setThumbErr(true)}
             loading="lazy"
@@ -64,7 +105,6 @@ function PageThumbnail({
         )}
       </div>
 
-      {/* Red deletion overlay when marked */}
       {isCropMode && isMarked && (
         <div className="absolute inset-0 bg-red-500/40 flex items-center justify-center pointer-events-none">
           <div className="w-8 h-8 bg-red-600 rounded-full flex items-center justify-center shadow-md">
@@ -73,36 +113,56 @@ function PageThumbnail({
         </div>
       )}
 
-      {/* Page number badge — bottom-right overlay */}
+      {isScissorsMode && (
+        <div className="absolute inset-0 bg-red-500/0 group-hover:bg-red-500/30
+          flex items-center justify-center pointer-events-none
+          transition-colors duration-150">
+          <div className="opacity-0 group-hover:opacity-100 w-9 h-9 bg-red-500 rounded-full
+            flex items-center justify-center shadow-lg transition-opacity duration-150">
+            <Scissors size={15} className="text-white" />
+          </div>
+        </div>
+      )}
+
+      {isScissorsMode && isCutConfirmOpen && (
+        <div
+          className="absolute top-2 left-2 right-2 z-20"
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="bg-white/95 backdrop-blur-sm border border-apple-border/70 shadow-mac-lg rounded-lg p-2">
+            <p className="text-[11px] text-apple-text font-medium leading-tight">
+              Delete this page?
+            </p>
+            <div className="mt-2 flex gap-2">
+              <button
+                onClick={(e) => { e.stopPropagation(); onCutPage(pageIdx, { confirmed: true }); }}
+                className="flex-1 text-[11px] font-semibold py-1.5 rounded bg-red-500 hover:bg-red-600 text-white transition-colors duration-150"
+              >
+                Confirm
+              </button>
+              <button
+                onClick={(e) => { e.stopPropagation(); onCancelCut?.(); }}
+                className="flex-1 text-[11px] font-medium py-1.5 rounded bg-gray-200 hover:bg-gray-300 text-gray-700 transition-colors duration-150"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="absolute bottom-2 right-2 bg-black/50 text-white text-[10px]
         font-medium px-1.5 py-0.5 rounded backdrop-blur-sm pointer-events-none">
-        {pageIdx + 1} / {totalPages}
+        {displayIdx + 1} / {totalPages}
       </div>
     </div>
   );
 }
 
-/**
- * WorkspaceCard — resizable, draggable PDF mini-window in the workspace.
- *
- * Props
- *  file             full file object
- *  onRemove         close this panel
- *  onDragStart      header drag start (workspace → sidebar)
- *  onDragEnd        drag end / cancel
- *  onPageClick      (pageIdx) → open ExpandedPageView
- *  isSelected       show blue selection ring
- *  onSelect         called when the card is clicked (to select it)
- *  cropMode         null | { markedPages: Set<number> }
- *  onTogglePageMark (pageIdx) toggle deletion mark in crop mode
- *  onConfirmCrop    confirm deletion and trigger download
- *  onCancelCrop     exit crop mode without changes
- */
 export default function WorkspaceCard({
   file,
   onRemove,
-  onDragStart,
-  onDragEnd,
   onPageClick,
   isSelected,
   onSelect,
@@ -110,6 +170,25 @@ export default function WorkspaceCard({
   onTogglePageMark,
   onConfirmCrop,
   onCancelCrop,
+  onPageReorderChange,
+  isScissorsActive,
+  onDeactivateScissors,
+  onPanelDragStart,
+  onPanelDragMove,
+  onPanelDragEnd,
+  onExternalPageDragStart,
+  isDragging,
+  onDragOverPanel,
+  isMergeTarget,
+  isMergeSource,
+  isPageDropTarget,
+  dragStyle,
+  onRegisterPanelEl,
+  disablePanelDrag,
+  // Page drag state forwarded from Workspace
+  draggingPageIndex,
+  reorderInsertBefore,
+  onRegisterPageEl,
 }) {
   const [localName,   setLocalName]   = useState(file.filename);
   const [editingName, setEditingName] = useState(false);
@@ -117,6 +196,7 @@ export default function WorkspaceCard({
   const [panelWidth,  setPanelWidth]  = useState(300);
   const [isResizing,  setIsResizing]  = useState(false);
 
+  const panelRef      = useRef(null);
   const resizeStartX  = useRef(0);
   const resizeStartW  = useRef(0);
   const nameInputRef  = useRef(null);
@@ -130,7 +210,30 @@ export default function WorkspaceCard({
     if (!localName.trim()) setLocalName(file.filename);
   };
 
-  const pages = Array.from({ length: file.page_count }, (_, i) => i);
+  const pageOrder = (file.pages || Array.from({ length: file.page_count }, (_, i) => i))
+    .map((p) => ({ originalPage: p }));
+
+  const [cutConfirmPage, setCutConfirmPage] = useState(null);
+
+  useEffect(() => {
+    if (!isScissorsActive && cutConfirmPage !== null) setCutConfirmPage(null);
+  }, [isScissorsActive, cutConfirmPage]);
+
+  const commitCutPage = (originalPageIdx) => {
+    const next = pageOrder.filter((p) => p.originalPage !== originalPageIdx);
+    onPageReorderChange?.(file.file_id, next.map((p) => p.originalPage));
+  };
+
+  const handleCutPage = (originalPageIdx, opts) => {
+    if (!opts?.confirmed) {
+      setCutConfirmPage(originalPageIdx);
+      return;
+    }
+    setCutConfirmPage(null);
+    commitCutPage(originalPageIdx);
+  };
+
+  const thumbnailWidth = panelWidth - 24;
 
   // ── Right-edge resize ──────────────────────────────────────────────────────
   const startResize = (e) => {
@@ -152,52 +255,79 @@ export default function WorkspaceCard({
     window.addEventListener("mouseup",   onMouseUp);
   };
 
-  // ── Header drag — move panel back to sidebar ───────────────────────────────
-  const handleDragStart = (e) => {
-    const ghost = document.createElement("div");
-    ghost.className = "drag-ghost";
-    document.body.appendChild(ghost);
-    e.dataTransfer.setDragImage(ghost, 0, 0);
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        if (document.body.contains(ghost)) document.body.removeChild(ghost);
-      });
-    });
-
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("drag-source", "workspace");
-    onDragStart(file);
-  };
-
-  const handleDragEnd = () => onDragEnd && onDragEnd();
-
   const markedCount = cropMode?.markedPages?.size ?? 0;
 
   return (
     <div
-      style={{ width: panelWidth }}
-      onClick={onSelect}
+      ref={(el) => {
+        panelRef.current = el;
+        onRegisterPanelEl?.(el);
+      }}
+      style={{ width: panelWidth, ...(dragStyle || {}) }}
+      onClick={(e) => { e.stopPropagation(); onSelect?.(); }}
       className={`
-        relative flex-shrink-0 flex flex-col bg-white overflow-hidden
+        relative flex-shrink-0 flex flex-col bg-white overflow-hidden h-full
         animate-panelEntry rounded-lg cursor-default
-        transition-all duration-200
-        ${isSelected
-          ? "border-2 border-apple-blue shadow-[0_0_0_3px_rgba(0,113,227,0.18)] shadow-mac-lg"
-          : "border border-apple-border/50 shadow-mac hover:shadow-mac-lg"
+        transition-all duration-150
+        ${isDragging
+          ? "border-2 border-dashed border-apple-border/60"
+          : isSelected
+            ? "border-2 border-apple-blue shadow-[0_0_0_3px_rgba(0,113,227,0.18)] shadow-mac-lg"
+            : "border border-apple-border/50 shadow-mac hover:shadow-mac-lg"
         }
+        ${(isMergeTarget || isMergeSource) ? "border-2 border-violet-500 shadow-[0_0_0_3px_rgba(139,92,246,0.22)]" : ""}
+        ${isPageDropTarget ? "border-2 border-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.18)]" : ""}
+        ${isDragging ? "invisible" : "visible"}
         ${isResizing ? "select-none" : ""}
-        ${cropMode ? "ring-2 ring-red-400 ring-offset-0" : ""}
+        ${cropMode         ? "ring-2 ring-red-400    ring-offset-0" : ""}
+        ${isScissorsActive ? "ring-2 ring-orange-400 ring-offset-0" : ""}
       `}
     >
+      {(isMergeTarget || isMergeSource) && (
+        <div className="absolute inset-0 pointer-events-none z-20">
+          <div className="absolute inset-0 bg-violet-500/5" />
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 px-2.5 py-1 rounded-full
+            bg-violet-600 text-white text-[11px] font-semibold shadow-sm">
+            Merge
+          </div>
+        </div>
+      )}
+
+      {isPageDropTarget && (
+        <div className="absolute inset-0 pointer-events-none z-20">
+          <div className="absolute inset-0 bg-emerald-500/5" />
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 px-2.5 py-1 rounded-full
+            bg-emerald-600 text-white text-[11px] font-semibold shadow-sm">
+            Drop page
+          </div>
+        </div>
+      )}
+
       {/* ── Panel header ────────────────────────────────────────────────────── */}
       <div
-        draggable
-        onDragStart={handleDragStart}
-        onDragEnd={handleDragEnd}
+        onMouseDown={(e) => {
+          if (disablePanelDrag) return;
+          if (e.button !== 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+
+          const rect = panelRef.current?.getBoundingClientRect?.();
+          if (rect) {
+            onPanelDragStart?.({
+              fileId: file.file_id,
+              rect,
+              offsetX: e.clientX - rect.left,
+              offsetY: e.clientY - rect.top,
+              x: e.clientX,
+              y: e.clientY,
+            });
+          } else {
+            onPanelDragStart?.({ fileId: file.file_id, x: e.clientX, y: e.clientY });
+          }
+        }}
         onClick={(e) => e.stopPropagation()}
         className="flex items-center gap-2 px-3 py-2.5 bg-white border-b border-apple-border/60
-          cursor-grab active:cursor-grabbing flex-shrink-0 select-none"
-        title="Drag back to sidebar to close"
+          flex-shrink-0 select-none cursor-grab active:cursor-grabbing"
       >
         <GripVertical size={14} className="text-apple-border flex-shrink-0" />
         <FileText     size={13} className="text-red-500 flex-shrink-0" />
@@ -242,8 +372,7 @@ export default function WorkspaceCard({
         </button>
       </div>
 
-      {/* ── Crop mode banner ─────────────────────────────────────────────────
-          Shown at the top of the page list when crop mode is active. */}
+      {/* ── Crop mode banner ── */}
       {cropMode && (
         <div className="flex-shrink-0 px-3 py-1.5 bg-red-50 border-b border-red-200 flex items-center gap-2">
           <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
@@ -255,23 +384,69 @@ export default function WorkspaceCard({
         </div>
       )}
 
-      {/* ── Scrollable page list ─────────────────────────────────────────────── */}
-      <div className="flex-1 overflow-y-auto bg-apple-gray p-3 space-y-3 min-h-0">
-        {pages.map((pageIdx) => (
-          <PageThumbnail
-            key={pageIdx}
-            fileId={file.file_id}
-            pageIdx={pageIdx}
-            totalPages={file.page_count}
-            onPageClick={onPageClick}
-            isCropMode={!!cropMode}
-            isMarked={cropMode?.markedPages.has(pageIdx) ?? false}
-            onToggleMark={onTogglePageMark}
-          />
+      {/* ── Scissors mode banner ── */}
+      {isScissorsActive && (
+        <div className="flex-shrink-0 px-3 py-1.5 bg-orange-50 border-b border-orange-200
+          flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            <Scissors size={11} className="text-orange-500 flex-shrink-0" />
+            <p className="text-[11px] text-orange-700 font-medium">
+              Click a page to cut it
+            </p>
+          </div>
+          <button
+            onClick={(e) => { e.stopPropagation(); onDeactivateScissors(); }}
+            className="text-[10px] text-orange-500 hover:text-orange-700 font-medium
+              transition-colors duration-150"
+          >
+            Done
+          </button>
+        </div>
+      )}
+
+      {/* ── Scrollable page list ── */}
+      <div className="flex-1 overflow-y-auto bg-apple-gray p-3 space-y-2 min-h-0">
+        {pageOrder.map((page, listIdx) => (
+          <React.Fragment key={String(page.originalPage)}>
+            {/* Insertion line — shown above this slot during within-panel drag */}
+            {reorderInsertBefore === listIdx && (
+              <div className="h-0.5 bg-apple-blue rounded-full mx-1" />
+            )}
+            <PageThumbnail
+              fileId={file.file_id}
+              pageIdx={page.originalPage}
+              displayIdx={listIdx}
+              totalPages={pageOrder.length}
+              onPageClick={onPageClick}
+              isCropMode={!!cropMode}
+              isMarked={cropMode?.markedPages.has(page.originalPage) ?? false}
+              onToggleMark={onTogglePageMark}
+              thumbnailWidth={thumbnailWidth}
+              isScissorsMode={isScissorsActive}
+              onCutPage={handleCutPage}
+              isCutConfirmOpen={cutConfirmPage === page.originalPage}
+              onCancelCut={() => setCutConfirmPage(null)}
+              isBeingDragged={draggingPageIndex === page.originalPage}
+              onRegisterEl={(el) => onRegisterPageEl?.(page.originalPage, el)}
+              onExternalDragStart={({ rect, x, y }) => {
+                onExternalPageDragStart?.({
+                  fileId: file.file_id,
+                  pageIndex: page.originalPage,
+                  rect,
+                  x,
+                  y,
+                });
+              }}
+            />
+          </React.Fragment>
         ))}
+        {/* Insertion line at the very end */}
+        {reorderInsertBefore === pageOrder.length && (
+          <div className="h-0.5 bg-apple-blue rounded-full mx-1" />
+        )}
       </div>
 
-      {/* ── Crop mode confirm/cancel bar ─────────────────────────────────────── */}
+      {/* ── Crop mode confirm/cancel bar ── */}
       {cropMode && (
         <div className="flex-shrink-0 flex gap-2 p-2 bg-red-50 border-t border-red-200">
           <button
@@ -296,7 +471,7 @@ export default function WorkspaceCard({
         </div>
       )}
 
-      {/* ── Right-edge resize handle ─────────────────────────────────────────── */}
+      {/* ── Right-edge resize handle ── */}
       <div
         onMouseDown={(e) => { e.stopPropagation(); startResize(e); }}
         className="absolute top-0 right-0 w-1.5 h-full cursor-col-resize

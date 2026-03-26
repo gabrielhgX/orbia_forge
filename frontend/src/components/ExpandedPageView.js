@@ -39,9 +39,10 @@ export default function ExpandedPageView({ file, initialPage, onClose }) {
   const canPrev = currentPage > 0;
   const canNext = currentPage < file.page_count - 1;
 
-  // High-resolution render (900 px wide keeps quality without overloading)
+  // High-resolution render — 1 400 px gives sharp text even on retina displays
+  // without exceeding typical viewport widths.
   const imgUrl =
-    `${BACKEND_BASE_URL}/api/files/${file.file_id}/thumbnail?page=${currentPage}&width=900`;
+    `${BACKEND_BASE_URL}/api/files/${file.file_id}/thumbnail?page=${currentPage}&width=1400`;
 
   // ── Page-dot navigation helpers ──────────────────────────────────────────
   // At most 13 evenly-spaced dots for long documents
@@ -65,7 +66,7 @@ export default function ExpandedPageView({ file, initialPage, onClose }) {
       <div
         className="relative flex flex-col bg-white rounded-md overflow-hidden
           shadow-[0_24px_80px_rgba(0,0,0,0.6)] animate-slideUp"
-        style={{ width: "min(880px, 94vw)", maxHeight: "94vh" }}
+        style={{ width: "min(1100px, 96vw)", height: "96vh" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* ── Header bar ─────────────────────────────────────────────────── */}
@@ -105,11 +106,11 @@ export default function ExpandedPageView({ file, initialPage, onClose }) {
             object-contain ensures the full page is visible with correct
             proportions — no cropping, no distortion. */}
         <div className="flex-1 min-h-0 relative flex items-center justify-center
-          bg-[#f0f0f0] p-6">
+          bg-[#f0f0f0] p-2">
 
           {/* Loading shimmer */}
           {!imgLoaded && (
-            <div className="absolute inset-6 bg-gray-200 animate-pulse rounded" />
+            <div className="absolute inset-0 bg-gray-200 animate-pulse rounded" />
           )}
 
           <img

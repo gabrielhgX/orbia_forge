@@ -1,33 +1,12 @@
 import { ArrowDownToLine, FileText, GitMerge } from "lucide-react";
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import WorkspaceCard from "./WorkspaceCard";
 
-/**
- * Workspace — the main PDF canvas area.
- *
- * Props
- *  files                  workspace files array
- *  draggedFile            file being dragged in from sidebar
- *  onDrop                 sidebar card dropped onto canvas
- *  onRemove               close a panel
- *  onDragStartFromWorkspace  header drag start
- *  onDragEndFromWorkspace    drag end / cancel
- *  onPageClick            (file, pageIdx) open ExpandedPageView
- *  selectedFileId         file_id of selected panel (or null)
- *  onSelectPanel          (fileId) select a panel
- *  onDownload             download the selected file
- *  pageCropMode           null | { fileId, markedPages: Set }
- *  onTogglePageMark       (pageIdx) toggle deletion mark
- *  onConfirmCrop          confirm deletion
- *  onCancelCrop           exit crop mode
- */
 export default function Workspace({
   files,
   draggedFile,
   onDrop,
   onRemove,
-  onDragStartFromWorkspace,
-  onDragEndFromWorkspace,
   onPageClick,
   selectedFileId,
   onSelectPanel,
@@ -36,28 +15,383 @@ export default function Workspace({
   onTogglePageMark,
   onConfirmCrop,
   onCancelCrop,
+  onPageReorderChange,
+  scissorsFileId,
+  onDeactivateScissors,
+  onReorderWorkspacePanels,
+  onMergePanels,
+  onMovePageToPanel,
+  onExtractPageToNewPanel,
 }) {
-  const [dragOver, setDragOver] = useState(false);
+  const [dragOverFile, setDragOverFile] = useState(false);
+
+  // ── Page drag state (mouse-based, cross-PDF move / extract) ─────────────────
+  const [pageDrag, setPageDrag] = useState(null);
+  const pageDragRef = useRef(null);
+  const [pageDropTargetId, setPageDropTargetId] = useState(null);
+  const pageDropTargetIdRef = useRef(null);
+  const lastPageCursorRef = useRef({ x: 0, y: 0 });
+  const cleanupPageMouseListenersRef = useRef(null);
+
+  // ── Panel drag state ───────────────────────────────────────────────────────
+  const [draggingPanelId, setDraggingPanelId] = useState(null);
+  const draggingPanelIdRef = useRef(null);
+  const [dragPos, setDragPos] = useState(null); // { x, y, offsetX, offsetY, w, h }
+  const panelElsRef = useRef({});
+  const rafMoveRef = useRef(0);
+  // Live visual order during drag; null = not dragging, use files prop
+  const [dragOrder, setDragOrder] = useState(null);
+  // Set to true when a merge is triggered so dragEnd skips reorder commit
+  const mergeTriggeredRef = useRef(false);
+  // Tracks last hovered panel to avoid redundant state updates on rapid dragover
+  const lastDragOverRef = useRef(null);
+  const [mergeHoverPanelId, setMergeHoverPanelId] = useState(null);
+  const lastLoggedHoverRef = useRef(null);
+
+  const cleanupMouseListenersRef = useRef(null);
+  const mergeHoverPanelIdRef = useRef(null);
+
+  const [isMergeMode, setIsMergeMode] = useState(false);
+  const isMergeModeRef = useRef(false);
+  const dragMetaRef = useRef({ offsetX: 0, offsetY: 0, w: 0, h: 0 });
+  const [pendingMerge, setPendingMerge] = useState(null); // { sourceId, targetId }
+
+  const handlePanelDragStart = (info) => {
+    const fileId = info?.fileId;
+    if (!fileId) return;
+    if (pageDragRef.current) return;
+    if (pendingMerge) return;
+    draggingPanelIdRef.current = fileId;
+    setDraggingPanelId(fileId);
+    lastDragOverRef.current = null;
+    mergeHoverPanelIdRef.current = null;
+    isMergeModeRef.current = false;
+    setIsMergeMode(false);
+    if (info?.rect) {
+      dragMetaRef.current = {
+        offsetX: info.offsetX ?? 0,
+        offsetY: info.offsetY ?? 0,
+        w: info.rect.width,
+        h: info.rect.height,
+      };
+      setDragPos({
+        x: Math.round(info.rect.left + (info.offsetX ?? 0)),
+        y: Math.round(info.rect.top + (info.offsetY ?? 0)),
+        offsetX: info.offsetX ?? 0,
+        offsetY: info.offsetY ?? 0,
+        w: info.rect.width,
+        h: info.rect.height,
+      });
+    } else {
+      dragMetaRef.current = { offsetX: 0, offsetY: 0, w: 0, h: 0 };
+      setDragPos(null);
+    }
+
+    // Mouse-based drag: track cursor globally for reliable merge detection.
+    const onMouseMove = (e) => {
+      handlePanelDragMove({ fileId, x: e.clientX, y: e.clientY });
+    };
+    const onMouseUp = () => {
+      const targetId = mergeHoverPanelIdRef.current;
+      if (isMergeModeRef.current && targetId && fileId) {
+        // Don't commit reorder; show inline confirm UI.
+        mergeTriggeredRef.current = true;
+        setPendingMerge({ sourceId: fileId, targetId });
+      }
+      handlePanelDragEnd();
+    };
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    cleanupMouseListenersRef.current = () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+      cleanupMouseListenersRef.current = null;
+    };
+
+    // Ensure we process an initial position immediately.
+    if (typeof info?.x === "number" && typeof info?.y === "number") {
+      handlePanelDragMove({ fileId, x: info.x, y: info.y });
+    }
+  };
+
+  const handlePanelDragMove = ({ fileId, x, y }) => {
+    const activeId = draggingPanelIdRef.current;
+    if (!activeId || fileId !== activeId) return;
+    if (pendingMerge) return;
+    if (pageDragRef.current) return;
+    const rx = Math.round(x);
+    const ry = Math.round(y);
+
+    // Update ghost position immediately so it stays locked to the cursor.
+    // Keep collision/reorder work in rAF to avoid excessive layout thrash.
+    setDragPos((prev) => (prev ? { ...prev, x: rx, y: ry } : prev));
+    if (rafMoveRef.current) cancelAnimationFrame(rafMoveRef.current);
+    rafMoveRef.current = requestAnimationFrame(() => {
+      // Tab-style merge activation: if dragged panel overlaps a target panel horizontally
+      // by at least 50% of the target width, activate merge mode.
+      const draggedLeft = rx - (dragMetaRef.current?.offsetX ?? 0);
+      const draggedTop = ry - (dragMetaRef.current?.offsetY ?? 0);
+      const draggedW = dragMetaRef.current?.w ?? 0;
+      const draggedH = dragMetaRef.current?.h ?? 0;
+      const draggedRight = draggedLeft + draggedW;
+      const draggedBottom = draggedTop + draggedH;
+
+      let nextMergeHover = null;
+      let bestScore = 0;
+
+      for (const f of files) {
+        if (f.file_id === activeId) continue;
+        const el = panelElsRef.current[f.file_id];
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+
+        const overlapX = Math.max(0, Math.min(draggedRight, r.right) - Math.max(draggedLeft, r.left));
+        const overlapY = Math.max(0, Math.min(draggedBottom, r.bottom) - Math.max(draggedTop, r.top));
+
+        // Require some vertical overlap so a panel in another row (if any) doesn't trigger.
+        if (overlapY < Math.min(draggedH, r.height) * 0.25) continue;
+        if (overlapX < r.width * 0.5) continue;
+
+        // Prefer the panel with the largest horizontal overlap.
+        if (overlapX > bestScore) {
+          bestScore = overlapX;
+          nextMergeHover = f.file_id;
+        }
+      }
+
+      const nextMergeMode = Boolean(nextMergeHover);
+      if (isMergeModeRef.current !== nextMergeMode) {
+        isMergeModeRef.current = nextMergeMode;
+        setIsMergeMode(nextMergeMode);
+      }
+
+      setMergeHoverPanelId(nextMergeHover);
+      mergeHoverPanelIdRef.current = nextMergeHover;
+      if (lastLoggedHoverRef.current !== nextMergeHover) {
+        lastLoggedHoverRef.current = nextMergeHover;
+        if (nextMergeHover) console.log("[merge-hover] target:", nextMergeHover, "cursor:", rx, ry);
+        else console.log("[merge-hover] none", "cursor:", rx, ry);
+      }
+
+      // While merging, disable reorder updates.
+      if (nextMergeMode) return;
+
+      const ids = (dragOrder || files.map((f) => f.file_id)).filter((id) => id !== activeId);
+      const cursorX = rx;
+      let insertAt = ids.length;
+      for (let i = 0; i < ids.length; i++) {
+        const el = panelElsRef.current[ids[i]];
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        const mid = r.left + r.width / 2;
+        if (cursorX < mid) { insertAt = i; break; }
+      }
+      const next = ids.slice();
+      next.splice(insertAt, 0, activeId);
+      setDragOrder(next);
+    });
+  };
+
+  // Cleanup safeguard if component unmounts mid-drag.
+  useEffect(() => {
+    return () => {
+      cleanupMouseListenersRef.current?.();
+      cleanupPageMouseListenersRef.current?.();
+    };
+  }, []);
+
+  const handlePanelDragEnd = () => {
+    cleanupMouseListenersRef.current?.();
+    draggingPanelIdRef.current = null;
+    isMergeModeRef.current = false;
+    setIsMergeMode(false);
+    if (!mergeTriggeredRef.current && dragOrder && draggingPanelId) {
+      const finalIndex = dragOrder.indexOf(draggingPanelId);
+      if (finalIndex !== -1) onReorderWorkspacePanels?.(draggingPanelId, finalIndex);
+    }
+    mergeTriggeredRef.current = false;
+    lastDragOverRef.current = null;
+    setDraggingPanelId(null);
+    setDragOrder(null);
+    setDragPos(null);
+    setMergeHoverPanelId(null);
+  };
+
+  const handleExternalPageDragStart = (info) => {
+    if (!info?.fileId || typeof info?.pageIndex !== "number") return;
+    if (pendingMerge) return;
+    if (draggingPanelIdRef.current) return;
+    if (pageDragRef.current) return;
+
+    const rect = info?.rect;
+    const start = {
+      sourceFileId: info.fileId,
+      pageIndex: info.pageIndex,
+      x: Math.round(info.x),
+      y: Math.round(info.y),
+      offsetX: rect ? Math.round(info.x - rect.left) : 0,
+      offsetY: rect ? Math.round(info.y - rect.top) : 0,
+      w: rect ? Math.round(rect.width) : 240,
+      h: rect ? Math.round(rect.height) : 160,
+    };
+
+    pageDragRef.current = start;
+    setPageDrag(start);
+    setPageDropTargetId(null);
+    pageDropTargetIdRef.current = null;
+    lastPageCursorRef.current = { x: start.x, y: start.y };
+
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = "none";
+
+    const onMouseMove = (e) => {
+      const current = pageDragRef.current;
+      if (!current) return;
+      const rx = Math.round(e.clientX);
+      const ry = Math.round(e.clientY);
+      lastPageCursorRef.current = { x: rx, y: ry };
+      const next = { ...current, x: rx, y: ry };
+      pageDragRef.current = next;
+      setPageDrag(next);
+
+      // Detect which panel is under cursor (exclude source panel).
+      let targetId = null;
+      for (const f of files) {
+        if (f.file_id === current.sourceFileId) continue;
+        const el = panelElsRef.current[f.file_id];
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        if (rx >= r.left && rx <= r.right && ry >= r.top && ry <= r.bottom) {
+          targetId = f.file_id;
+          break;
+        }
+      }
+      if (pageDropTargetIdRef.current !== targetId) {
+        pageDropTargetIdRef.current = targetId;
+        setPageDropTargetId(targetId);
+        if (targetId) console.log("[page-drag] target panel detected:", targetId);
+        else console.log("[page-drag] extract mode");
+      }
+    };
+
+    const onMouseUp = () => {
+      const current = pageDragRef.current;
+      // Recompute from last cursor position to avoid missing the final hover.
+      const { x: rx, y: ry } = lastPageCursorRef.current;
+      let targetId = null;
+      for (const f of files) {
+        if (f.file_id === current?.sourceFileId) continue;
+        const el = panelElsRef.current[f.file_id];
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        if (rx >= r.left && rx <= r.right && ry >= r.top && ry <= r.bottom) {
+          targetId = f.file_id;
+          break;
+        }
+      }
+
+      cleanupPageMouseListenersRef.current?.();
+      pageDragRef.current = null;
+      setPageDrag(null);
+      setPageDropTargetId(null);
+      pageDropTargetIdRef.current = null;
+      document.body.style.userSelect = prevUserSelect;
+
+      if (!current) return;
+      if (targetId) {
+        console.log("[page-drag] drop -> move", {
+          sourceFileId: current.sourceFileId,
+          pageIndex: current.pageIndex,
+          targetFileId: targetId,
+        });
+        onMovePageToPanel?.({
+          sourceFileId: current.sourceFileId,
+          pageIndex: current.pageIndex,
+          targetFileId: targetId,
+        });
+      } else {
+        console.log("[page-drag] drop -> extract", {
+          sourceFileId: current.sourceFileId,
+          pageIndex: current.pageIndex,
+        });
+        onExtractPageToNewPanel?.({
+          sourceFileId: current.sourceFileId,
+          pageIndex: current.pageIndex,
+        });
+      }
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    cleanupPageMouseListenersRef.current = () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+      cleanupPageMouseListenersRef.current = null;
+    };
+  };
+
+  // Called by WorkspaceCard's onDragOver — reorders panels in real time
+  const handleDragOverPanel = (targetFileId) => {
+    if (!draggingPanelId || draggingPanelId === targetFileId) return;
+    if (lastDragOverRef.current === targetFileId) return;
+    lastDragOverRef.current = targetFileId;
+
+    const current = dragOrder || files.map((f) => f.file_id);
+    const from = current.indexOf(draggingPanelId);
+    const to   = current.indexOf(targetFileId);
+    if (from === -1 || to === -1) return;
+
+    const next = [...current];
+    next.splice(from, 1);
+    next.splice(to, 0, draggingPanelId);
+    setDragOrder(next);
+  };
+
+  // Derive display order: use live dragOrder during drag, otherwise files prop
+  const displayFiles = (() => {
+    if (pendingMerge?.sourceId && pendingMerge?.targetId) {
+      const sourceId = pendingMerge.sourceId;
+      const targetId = pendingMerge.targetId;
+      const idxS = files.findIndex((f) => f.file_id === sourceId);
+      const idxT = files.findIndex((f) => f.file_id === targetId);
+      const insertAt = Math.max(0, Math.min(idxS, idxT));
+      const rest = files.filter((f) => f.file_id !== sourceId && f.file_id !== targetId);
+      const placeholder = {
+        file_id: "__pending_merge__",
+        __kind: "pending_merge",
+        sourceId,
+        targetId,
+      };
+      return [...rest.slice(0, insertAt), placeholder, ...rest.slice(insertAt)];
+    }
+    return dragOrder
+      ? dragOrder.map((id) => files.find((f) => f.file_id === id)).filter(Boolean)
+      : files;
+  })();
 
   const isEmpty = files.length === 0;
   const selectedFile = files.find((f) => f.file_id === selectedFileId) ?? null;
 
-  // ── Drop zone ─────────────────────────────────────────────────────────────
+  // ── Sidebar drop zone ──────────────────────────────────────────────────────
+  // Note: panel-to-panel reorder is handled by mouse move collision detection.
+
   const handleDragOver = (e) => {
+    const source = e.dataTransfer.getData("drag-source");
+    if (source !== "sidebar") return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
-    if (!dragOver) setDragOver(true);
+    if (!dragOverFile) setDragOverFile(true);
   };
 
   const handleDragLeave = (e) => {
-    if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false);
+    if (!e.currentTarget.contains(e.relatedTarget)) setDragOverFile(false);
   };
 
   const handleDrop = (e) => {
     e.preventDefault();
-    setDragOver(false);
+    setDragOverFile(false);
     const source = e.dataTransfer.getData("drag-source");
-    if (draggedFile && source !== "workspace") onDrop(draggedFile);
+    if (source === "sidebar" && draggedFile) onDrop(draggedFile);
   };
 
   // Clicking the canvas background deselects panels
@@ -80,7 +414,6 @@ export default function Workspace({
           </p>
         </div>
 
-        {/* Download action — visible only when a panel is selected */}
         {selectedFile && (
           <button
             onClick={onDownload}
@@ -107,14 +440,14 @@ export default function Workspace({
       {/* ── Canvas ── */}
       <div
         className={`flex-1 relative overflow-hidden transition-colors duration-200
-          ${dragOver ? "bg-blue-50" : "bg-apple-gray"}`}
+          ${dragOverFile ? "bg-blue-50" : "bg-apple-gray"}`}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
         onClick={handleCanvasClick}
       >
-        {/* Drag-over overlay */}
-        {dragOver && (
+        {/* Sidebar drag-over overlay */}
+        {dragOverFile && (
           <div className="absolute inset-4 border-2 border-dashed border-apple-blue rounded-3xl
             flex flex-col items-center justify-center pointer-events-none z-10
             bg-blue-50/80 backdrop-blur-sm">
@@ -126,8 +459,37 @@ export default function Workspace({
           </div>
         )}
 
+        {pageDrag && (
+          <div className="fixed inset-0 pointer-events-none z-[10000]">
+            <div
+              style={{
+                position: "fixed",
+                left: pageDrag.x - pageDrag.offsetX,
+                top: pageDrag.y - pageDrag.offsetY,
+                width: pageDrag.w,
+                height: pageDrag.h,
+                transform: "translate3d(0px, 0px, 0px)",
+                boxShadow: "0 18px 46px rgba(0,0,0,0.24)",
+              }}
+              className="rounded-lg overflow-hidden bg-white"
+            >
+              <div className="w-full h-full bg-apple-gray flex items-center justify-center">
+                <div className="text-[11px] font-semibold text-apple-secondary">Dragging page</div>
+              </div>
+            </div>
+
+            {!pageDropTargetId && (
+              <div className="fixed bottom-4 left-0 right-0 flex justify-center">
+                <div className="px-3 py-1.5 rounded-full bg-emerald-600 text-white text-[11px] font-semibold shadow-sm">
+                  Create new PDF
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Empty state */}
-        {isEmpty && !dragOver && (
+        {isEmpty && !dragOverFile && (
           <div className="h-full flex flex-col items-center justify-center pb-16 px-8 select-none">
             <div className="relative mb-6">
               <div className="absolute -bottom-2 -right-3 w-14 h-16 bg-red-100 rounded-2xl rotate-6" />
@@ -145,40 +507,159 @@ export default function Workspace({
           </div>
         )}
 
-        {/* ── Horizontal panel row ─────────────────────────────────────────────
-            Panels are full-height, side-by-side, horizontally scrollable. */}
+        {/* ── Panel row — horizontal, scrollable ───────────────────────────── */}
         {!isEmpty && (
-          <div
-            className="absolute inset-0 overflow-x-auto overflow-y-hidden"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex gap-4 p-5 h-full items-stretch min-w-max">
-              {files.map((file) => {
+          <div className="absolute inset-0 overflow-x-auto overflow-y-hidden">
+            <div className="flex gap-2 p-4 h-full items-stretch min-w-max">
+              <div className="w-2 flex-shrink-0" />
+              {displayFiles.map((file, index) => {
+                if (file?.__kind === "pending_merge") {
+                  const sourceFile = files.find((f) => f.file_id === file.sourceId) || null;
+                  const targetFile = files.find((f) => f.file_id === file.targetId) || null;
+                  return (
+                    <React.Fragment key={file.file_id}>
+                      <div
+                        className="relative flex-shrink-0 flex flex-col bg-white overflow-hidden h-full rounded-lg
+                          border-2 border-violet-500 shadow-[0_0_0_3px_rgba(139,92,246,0.22)] shadow-mac"
+                        style={{ width: 320 }}
+                      >
+                        <div className="px-4 py-3 border-b border-apple-border/60">
+                          <div className="text-[11px] font-semibold text-violet-700">Merge</div>
+                          <div className="text-[13px] font-semibold text-apple-text mt-0.5">
+                            Merge these PDFs?
+                          </div>
+                          <div className="text-[11px] text-apple-secondary mt-1 truncate">
+                            {sourceFile?.filename || "(unknown)"} + {targetFile?.filename || "(unknown)"}
+                          </div>
+                        </div>
+
+                        <div className="flex-1 flex flex-col justify-center px-4 py-4 gap-2">
+                          <button
+                            className="w-full px-3 py-2 rounded-lg bg-violet-600 hover:bg-violet-700
+                              text-white text-[12px] font-semibold transition-colors"
+                            onClick={() => {
+                              const src = file.sourceId;
+                              const tgt = file.targetId;
+                              setPendingMerge(null);
+                              onMergePanels?.(src, tgt);
+                            }}
+                          >
+                            Confirm
+                          </button>
+                          <button
+                            className="w-full px-3 py-2 rounded-lg bg-white hover:bg-apple-gray
+                              text-apple-text text-[12px] font-semibold border border-apple-border/60
+                              transition-colors"
+                            onClick={() => setPendingMerge(null)}
+                          >
+                            Undo
+                          </button>
+                        </div>
+                      </div>
+
+                      {index < displayFiles.length - 1 && (
+                        <div className="w-2 flex-shrink-0" />
+                      )}
+                    </React.Fragment>
+                  );
+                }
                 const fileCropMode =
                   pageCropMode?.fileId === file.file_id ? pageCropMode : null;
                 return (
-                  <WorkspaceCard
-                    key={file.file_id}
-                    file={file}
-                    onRemove={onRemove}
-                    onDragStart={onDragStartFromWorkspace}
-                    onDragEnd={onDragEndFromWorkspace}
-                    onPageClick={(pageIdx) => {
-                      onSelectPanel(file.file_id);
-                      onPageClick(file, pageIdx);
-                    }}
-                    isSelected={selectedFileId === file.file_id}
-                    onSelect={() => onSelectPanel(file.file_id)}
-                    cropMode={fileCropMode}
-                    onTogglePageMark={onTogglePageMark}
-                    onConfirmCrop={onConfirmCrop}
-                    onCancelCrop={onCancelCrop}
-                  />
+                  <React.Fragment key={file.file_id}>
+                    <WorkspaceCard
+                      file={file}
+                      disablePageReorder={!!pageDrag}
+                      onRemove={onRemove}
+                      onPageClick={(pageIdx) => {
+                        onSelectPanel(file.file_id);
+                        onPageClick(file, pageIdx);
+                      }}
+                      isSelected={selectedFileId === file.file_id}
+                      onSelect={() => onSelectPanel(file.file_id)}
+                      cropMode={fileCropMode}
+                      onTogglePageMark={onTogglePageMark}
+                      onConfirmCrop={onConfirmCrop}
+                      onCancelCrop={onCancelCrop}
+                      onPageReorderChange={onPageReorderChange}
+                      isScissorsActive={scissorsFileId === file.file_id}
+                      onDeactivateScissors={onDeactivateScissors}
+                      onPanelDragStart={handlePanelDragStart}
+                      onPanelDragMove={handlePanelDragMove}
+                      onPanelDragEnd={handlePanelDragEnd}
+                      onExternalPageDragStart={handleExternalPageDragStart}
+                      isDragging={draggingPanelId === file.file_id}
+                      onDragOverPanel={handleDragOverPanel}
+                      isMergeTarget={
+                        mergeHoverPanelId === file.file_id &&
+                        draggingPanelId !== file.file_id
+                      }
+                      isMergeSource={
+                        isMergeMode && draggingPanelId === file.file_id
+                      }
+                      isPageDropTarget={pageDropTargetId === file.file_id}
+                      onRegisterPanelEl={(el) => {
+                        if (el) panelElsRef.current[file.file_id] = el;
+                        else delete panelElsRef.current[file.file_id];
+                      }}
+                    />
+
+                  {index < displayFiles.length - 1 && (
+                    <div className="w-2 flex-shrink-0" />
+                  )}
+                </React.Fragment>
                 );
               })}
-              {/* Trailing spacer */}
-              <div className="w-4 flex-shrink-0" />
             </div>
+          </div>
+        )}
+
+        {draggingPanelId && dragPos && (
+          <div className="fixed inset-0 pointer-events-none z-[10000]">
+            {(() => {
+              const ghostFile = files.find((f) => f.file_id === draggingPanelId) || null;
+              if (!ghostFile) return null;
+              return (
+                <div
+                  style={{
+                    position: "fixed",
+                    left: Math.round(dragPos.x - dragPos.offsetX),
+                    top: Math.round(dragPos.y - dragPos.offsetY),
+                    width: dragPos.w,
+                    height: dragPos.h,
+                    transform: "translate3d(0px, 0px, 0px)",
+                    backfaceVisibility: "hidden",
+                    willChange: "transform",
+                    imageRendering: "auto",
+                    boxShadow: "0 24px 60px rgba(0,0,0,0.28)",
+                  }}
+                >
+                  <WorkspaceCard
+                    file={ghostFile}
+                    disablePageReorder={!!pageDrag}
+                    onRemove={() => {}}
+                    onPageClick={() => {}}
+                    isSelected={false}
+                    onSelect={() => {}}
+                    cropMode={null}
+                    onTogglePageMark={() => {}}
+                    onConfirmCrop={() => {}}
+                    onCancelCrop={() => {}}
+                    onPageReorderChange={() => {}}
+                    isScissorsActive={false}
+                    onDeactivateScissors={() => {}}
+                    onPanelDragStart={() => {}}
+                    onPanelDragMove={() => {}}
+                    onPanelDragEnd={() => {}}
+                    isDragging={false}
+                    onDragOverPanel={() => {}}
+                    dragStyle={null}
+                    onRegisterPanelEl={() => {}}
+                    disablePanelDrag
+                  />
+                </div>
+              );
+            })()}
           </div>
         )}
 
