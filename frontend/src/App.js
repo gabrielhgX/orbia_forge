@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
+  cropPageLine,
   cropPages,
   deleteFile,
   downloadFile,
@@ -7,7 +8,9 @@ import {
   mergePages,
   reorderPages,
   splitPdf,
+  transformPage,
   uploadFile,
+  uploadPdfBlob,
 } from "./api";
 import ExpandedPageView from "./components/ExpandedPageView";
 import Sidebar from "./components/Sidebar";
@@ -27,6 +30,8 @@ export default function App() {
     });
   }, []);
 
+  const [pageOrders, setPageOrders] = useState({});
+
   // Sidebar → Workspace drag tracking
   const [draggedFile,          setDraggedFile]          = useState(null);
   // Workspace → Sidebar drag tracking
@@ -41,6 +46,12 @@ export default function App() {
   // Scissors (Page Cut) mode: the file_id of the panel currently in cut mode, or null
   const [scissorsFileId, setScissorsFileId] = useState(null);
 
+  // Page transform mode: null | 'rotate' | 'mirror'
+  const [pageTransformMode, setPageTransformMode] = useState(null);
+
+  // Area crop mode — user single-clicks a page to open the crop editor
+  const [areaCropMode, setAreaCropMode] = useState(false);
+
   const [showSplitModal, setShowSplitModal] = useState(false);
   const [splitTarget,    setSplitTarget]    = useState(null);
 
@@ -52,15 +63,6 @@ export default function App() {
 
   const toastIdRef = useRef(0);
 
-  // ── Bootstrap ────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    listFiles()
-      .then((next) => {
-        setFiles(next);
-      })
-      .catch(() => addToast("Could not reach the backend. Is it running?", "error"));
-  }, []);
-
   // ── Toasts ───────────────────────────────────────────────────────────────────
   const addToast = useCallback((message, type = "success") => {
     const id = ++toastIdRef.current;
@@ -68,20 +70,49 @@ export default function App() {
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 3500);
   }, []);
 
+  // ── Bootstrap ────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    listFiles()
+      .then((next) => {
+        setFiles(next);
+      })
+      .catch(() => addToast("Could not reach the backend. Is it running?", "error"));
+  }, [addToast]);
+
   // ── Upload ───────────────────────────────────────────────────────────────────
   const handleUpload = useCallback(
     async (acceptedFiles) => {
-      for (const file of acceptedFiles) {
-        try {
-          setLoading(true);
-          const result = await uploadFile(file);
-          setFiles((prev) => [...prev, result]);
-          addToast(`"${result.filename}" uploaded`, "success");
-        } catch {
-          addToast(`Failed to upload "${file.name}"`, "error");
-        } finally {
-          setLoading(false);
+      const nextUploads = [];
+      try {
+        setLoading(true);
+        for (const file of acceptedFiles) {
+          try {
+            const result = await uploadFile(file);
+            nextUploads.push(result);
+            addToast(`"${result.filename}" uploaded`, "success");
+          } catch {
+            addToast(`Failed to upload "${file.name}"`, "error");
+          }
         }
+
+        // Always show new uploads immediately.
+        if (nextUploads.length > 0) {
+          setFiles((prev) => {
+            const existing = new Set(prev.map((f) => f.file_id));
+            const appended = nextUploads.filter((f) => !existing.has(f.file_id));
+            return appended.length ? [...prev, ...appended] : prev;
+          });
+        }
+
+        // Refresh library from backend to ensure the sidebar reflects the registry.
+        try {
+          const latest = await listFiles();
+          setFiles(latest);
+        } catch {
+          addToast("Upload succeeded but library refresh failed. Is the backend running?", "error");
+        }
+      } finally {
+        setLoading(false);
       }
     },
     [addToast]
@@ -206,8 +237,125 @@ export default function App() {
     [workspaceFiles, addToast]
   );
 
-  const handleActivateScissors   = useCallback((fileId) => setScissorsFileId(fileId), []);
+  const handleActivateScissors   = useCallback(() => {
+    setScissorsFileId("active");
+    setPageTransformMode(null);
+    setAreaCropMode(false);
+    setPageCropMode(null);
+  }, []);
   const handleDeactivateScissors = useCallback(() => setScissorsFileId(null), []);
+
+  // ── Scissors page deletion (permanent backend delete) ────────────────────
+  const handleDeletePage = useCallback(
+    async ({ fileId, pageIndex }) => {
+      const source = workspaceFiles.find((f) => f.file_id === fileId);
+      if (!source) return;
+      const srcPageList = source.pages ?? Array.from({ length: source.page_count }, (_, i) => i);
+      const remaining = srcPageList.filter((p) => p !== pageIndex);
+
+      if (remaining.length === 0) {
+        setWorkspaceFilesLogged((prev) => prev.filter((f) => f.file_id !== fileId), "scissors_last_page");
+        if (selectedFileId === fileId) setSelectedFileId(null);
+        addToast("Last page deleted — panel closed", "success");
+        return;
+      }
+
+      try {
+        setLoading(true);
+        const updated = await mergePages(
+          remaining.map((p) => ({ fileId, pageIndex: p })),
+          source.filename
+        );
+        const withPages = { ...updated, pages: Array.from({ length: updated.page_count }, (_, i) => i) };
+        setWorkspaceFilesLogged(
+          (prev) => prev.map((f) => f.file_id === fileId ? withPages : f),
+          "scissors_delete"
+        );
+        if (selectedFileId === fileId) setSelectedFileId(updated.file_id);
+        addToast("Page deleted", "success");
+      } catch (err) {
+        addToast(err?.message || "Failed to delete page", "error");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [workspaceFiles, addToast, selectedFileId, scissorsFileId, setWorkspaceFilesLogged]
+  );
+
+  const handleActivateAreaCropMode = useCallback(() => {
+    setAreaCropMode(true);
+    setPageTransformMode(null);
+    setScissorsFileId(null);
+    setPageCropMode(null);
+  }, []);
+  const handleDeactivateAreaCropMode = useCallback(() => setAreaCropMode(false), []);
+
+  const handleCropPageLine = useCallback(
+    async (fileId, pageIndex, keepRectNorm) => {
+      setLoading(true);
+      try {
+        const updatedFile = await cropPageLine(fileId, pageIndex, keepRectNorm);
+        setWorkspaceFiles((prev) =>
+          prev.map((f) => {
+            if (f.file_id !== fileId) return f;
+            return {
+              ...f,
+              ...updatedFile,
+              pages: f.pages ?? Array.from({ length: updatedFile.page_count }, (_, i) => i),
+              _thumbV: Date.now(),
+            };
+          })
+        );
+        setPageModal(null);
+        setAreaCropMode(false);
+        addToast("Page cropped", "success");
+      } catch (err) {
+        addToast(err.message || "Failed to crop page", "error");
+        throw err; // let ExpandedPageView reset its loading state
+      } finally {
+        setLoading(false);
+      }
+    },
+    [addToast]
+  );
+
+  const handleActivateRotateMode = useCallback(() => {
+    setPageTransformMode("rotate");
+    setScissorsFileId(null);
+    setAreaCropMode(false);
+    setPageCropMode(null);
+  }, []);
+  const handleActivateMirrorMode = useCallback(() => {
+    setPageTransformMode("mirror");
+    setScissorsFileId(null);
+    setAreaCropMode(false);
+    setPageCropMode(null);
+  }, []);
+  const handleDeactivateTransformMode = useCallback(() => setPageTransformMode(null), []);
+
+  const handleTransformPage = useCallback(
+    async ({ fileId, pageIndex, transform }) => {
+      if (!fileId || typeof pageIndex !== "number") return;
+      const mode = transform || pageTransformMode;
+      if (mode !== "rotate" && mode !== "mirror") return;
+
+      try {
+        setLoading(true);
+        const updatedFile = await transformPage(fileId, pageIndex, mode);
+
+        setWorkspaceFilesLogged(
+          (prev) => prev.map((f) => (f.file_id === fileId ? { ...f, ...updatedFile, _thumbV: Date.now() } : f)),
+          `page_${mode}`
+        );
+        addToast(mode === "rotate" ? "Page rotated" : "Page mirrored", "success");
+      } catch (err) {
+        addToast(err?.message || "Failed to transform page", "error");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [addToast, pageTransformMode, setWorkspaceFilesLogged]
+  );
 
   const handleRemoveFromWorkspace = useCallback((fileId) => {
     setWorkspaceFilesLogged((prev) => prev.filter((f) => f.file_id !== fileId), "remove_from_workspace");
@@ -238,8 +386,6 @@ export default function App() {
       try {
         setLoading(true);
         const uploaded = await mergePages(pages, outputName);
-
-        setFiles((prev) => (prev.some((f) => f.file_id === uploaded.file_id) ? prev : [...prev, uploaded]));
         setWorkspaceFilesLogged((prev) => {
           const aIdx = prev.findIndex((f) => f.file_id === sourceFileId);
           const bIdx = prev.findIndex((f) => f.file_id === targetFileId);
@@ -368,8 +514,8 @@ export default function App() {
 
   // ── Page modal (enlarged page viewer) ───────────────────────────────────────
   const handlePageClick = useCallback((file, pageIdx) => {
-    setPageModal({ file, pageIdx });
-  }, []);
+    setPageModal({ file, pageIdx, cropMode: areaCropMode });
+  }, [areaCropMode]);
 
   // ── Split ────────────────────────────────────────────────────────────────────
   const openSplit = useCallback((file) => {
@@ -395,6 +541,22 @@ export default function App() {
 
   const selectedFile = workspaceFiles.find((f) => f.file_id === selectedFileId) ?? null;
 
+  // ── Active tool state (for Workspace deactivation strip) ─────────────────
+  const activeToolLabel =
+    pageTransformMode === "rotate" ? "Rotate" :
+    pageTransformMode === "mirror" ? "Mirror" :
+    areaCropMode   ? "Area Crop" :
+    scissorsFileId ? "Scissors" :
+    pageCropMode   ? "Crop" :
+    null;
+
+  const handleDeactivateActiveTool = useCallback(() => {
+    if (pageTransformMode) setPageTransformMode(null);
+    else if (areaCropMode) setAreaCropMode(false);
+    else if (scissorsFileId) setScissorsFileId(null);
+    else if (pageCropMode)   setPageCropMode(null);
+  }, [pageTransformMode, areaCropMode, scissorsFileId, pageCropMode]);
+
   // ── Render ───────────────────────────────────────────────────────────────────
   return (
     <div className="flex h-screen bg-apple-gray font-sans overflow-hidden">
@@ -413,10 +575,14 @@ export default function App() {
       {/* Centre — PDF panel canvas */}
       <Workspace
         files={workspaceFiles}
+        pageOrders={pageOrders}
         draggedFile={draggedFile}
         onDrop={handleDropToWorkspace}
         onRemove={handleRemoveFromWorkspace}
         onPageClick={handlePageClick}
+        pageTransformMode={pageTransformMode}
+        onTransformPage={handleTransformPage}
+        areaCropMode={areaCropMode}
         selectedFileId={selectedFileId}
         onSelectPanel={handleSelectPanel}
         onDownload={handleDownload}
@@ -432,6 +598,9 @@ export default function App() {
         onMergePanels={handleMergePanels}
         onMovePageToPanel={handleMovePageToPanel}
         onExtractPageToNewPanel={handleExtractPageToNewPanel}
+        onDeletePage={handleDeletePage}
+        activeToolLabel={activeToolLabel}
+        onDeactivateTool={handleDeactivateActiveTool}
       />
 
       {/* Right panel — editing tools */}
@@ -440,11 +609,18 @@ export default function App() {
         selectedFile={selectedFile}
         pageCropMode={pageCropMode}
         scissorsFileId={scissorsFileId}
+        pageTransformMode={pageTransformMode}
+        areaCropMode={areaCropMode}
         onSplit={openSplit}
         onActivatePageCrop={handleActivatePageCrop}
         onCancelCrop={handleCancelCrop}
         onActivateScissors={handleActivateScissors}
         onDeactivateScissors={handleDeactivateScissors}
+        onActivateRotateMode={handleActivateRotateMode}
+        onActivateMirrorMode={handleActivateMirrorMode}
+        onDeactivateTransformMode={handleDeactivateTransformMode}
+        onActivateAreaCropMode={handleActivateAreaCropMode}
+        onDeactivateAreaCropMode={handleDeactivateAreaCropMode}
       />
 
       {/* ── Modals ── */}
@@ -463,6 +639,8 @@ export default function App() {
           file={pageModal.file}
           initialPage={pageModal.pageIdx}
           onClose={() => setPageModal(null)}
+          cropLineMode={pageModal.cropMode || false}
+          onCropApply={handleCropPageLine}
         />
       )}
 

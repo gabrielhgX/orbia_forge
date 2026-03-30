@@ -140,3 +140,29 @@ export async function mergePages(pages, outputFilename = "merged.pdf") {
     throw new Error(err?.response?.data?.detail || err.message || "Operation failed");
   }
 }
+
+export async function cropPageLine(fileId, pageIndex, keepRect) {
+  try {
+    const { data } = await api.post("/api/crop-page-line", {
+      file_id: fileId,
+      page_index: pageIndex,
+      keep_rect: keepRect,
+    });
+    return data;
+  } catch (err) {
+    throw new Error(err?.response?.data?.detail || err.message || "Operation failed");
+  }
+}
+
+export async function transformPage(fileId, pageIndex, transform) {
+  try {
+    const { data } = await api.post("/api/transform-page", {
+      file_id: fileId,
+      page_index: pageIndex,
+      transform,
+    });
+    return data; // { file_id, filename, page_count, size }
+  } catch (err) {
+    throw new Error(err?.response?.data?.detail || err.message || "Operation failed");
+  }
+}

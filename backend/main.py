@@ -56,6 +56,19 @@ class ReorderRequest(BaseModel):
     page_order: List[int]  # 0-indexed original page numbers in desired display order
 
 
+class TransformPageRequest(BaseModel):
+    file_id: str
+    page_index: int  # 0-indexed
+    transform: str  # 'rotate' | 'mirror'
+
+
+class CropPageLineRequest(BaseModel):
+    file_id: str
+    page_index: int  # 0-indexed
+    # Normalized fractions of the page: [x0, y0, x1, y1] each in 0.0–1.0
+    keep_rect: List[float]
+
+
 def _remove_file(path: str) -> None:
     try:
         if os.path.exists(path):
@@ -95,10 +108,173 @@ async def upload_pdf(file: UploadFile = File(...)):
         "page_count": page_count,
         "size": len(content),
         "path": file_path,
+        "origin": "upload",
     }
     file_registry[file_id] = metadata
 
     return {k: v for k, v in metadata.items() if k != "path"}
+
+
+@app.post("/api/transform-page")
+async def transform_page(request: TransformPageRequest):
+    if request.file_id not in file_registry:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    meta = file_registry[request.file_id]
+    if not os.path.exists(meta["path"]):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    transform = (request.transform or "").lower().strip()
+    if transform not in {"rotate", "mirror"}:
+        raise HTTPException(status_code=400, detail="Invalid transform; expected 'rotate' or 'mirror'")
+
+    src_path = meta["path"]
+    src = fitz.open(src_path)
+    try:
+        total = len(src)
+        if request.page_index < 0 or request.page_index >= total:
+            raise HTTPException(status_code=400, detail=f"Invalid page index: {request.page_index}")
+
+        if transform == "rotate":
+            page = src[request.page_index]
+            page.set_rotation((page.rotation + 90) % 360)
+
+            tmp_path = f"{src_path}.tmp"
+            src.save(tmp_path)
+            src.close()
+            os.replace(tmp_path, src_path)
+        else:
+            # Mirror horizontally by building a new document where the target page
+            # is rendered onto a same-sized page through a horizontal-flip matrix
+            # applied to the content stream directly, avoiding any reliance on
+            # non-standard rect behaviour in show_pdf_page.
+            out = fitz.open()
+            try:
+                for i in range(total):
+                    if i != request.page_index:
+                        out.insert_pdf(src, from_page=i, to_page=i)
+                        continue
+
+                    pg = src[i]
+                    w, h = pg.rect.width, pg.rect.height
+                    new_page = out.new_page(width=w, height=h)
+
+                    # Insert the source page normally, then rewrite its content
+                    # stream to prepend a horizontal-flip CTM:
+                    #   [-1  0  0  1  w  0] cm   →  mirror about x = w/2
+                    new_page.show_pdf_page(new_page.rect, src, i, keep_proportion=False)
+
+                    # Wrap the XObject call with a save/CTM/restore so the flip
+                    # is baked into the page content rather than the XObject.
+                    xrefs = new_page.get_contents()
+                    if xrefs:
+                        raw = b"".join(out.xref_stream(x) for x in xrefs)
+                        flipped = (
+                            f"q -1 0 0 1 {w:.4f} 0 cm\n".encode()
+                            + raw
+                            + b"\nQ"
+                        )
+                        out.update_stream(xrefs[0], flipped)
+                        for x in xrefs[1:]:
+                            out.update_stream(x, b"")
+
+                tmp_path = f"{src_path}.tmp"
+                out.save(tmp_path)
+            finally:
+                out.close()
+            # Must close src before os.replace; Windows holds a file lock while open.
+            src.close()
+            os.replace(tmp_path, src_path)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Transform failed: {exc}") from exc
+    finally:
+        try:
+            src.close()
+        except Exception:
+            pass
+
+    meta["size"] = os.path.getsize(src_path)
+    file_registry[request.file_id] = meta
+    return {k: v for k, v in meta.items() if k != "path"}
+
+
+@app.post("/api/crop-page-line")
+async def crop_page_line(request: CropPageLineRequest):
+    """Crop a single page to the specified sub-rectangle and save it in-place.
+
+    keep_rect is [x0, y0, x1, y1] as fractions (0–1) of the current page size.
+    The result page will have exactly the cropped dimensions (not original size
+    with whitespace), because we create a new page sized to the clip area and
+    use show_pdf_page with clip= to transfer only that region.
+    """
+    if request.file_id not in file_registry:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    meta = file_registry[request.file_id]
+    if not os.path.exists(meta["path"]):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    keep = request.keep_rect
+    if len(keep) != 4:
+        raise HTTPException(status_code=400, detail="keep_rect must be [x0, y0, x1, y1]")
+
+    src_path = meta["path"]
+    src = fitz.open(src_path)
+    try:
+        total = len(src)
+        if request.page_index < 0 or request.page_index >= total:
+            raise HTTPException(status_code=400, detail=f"Invalid page index: {request.page_index}")
+
+        out = fitz.open()
+        try:
+            for i in range(total):
+                if i != request.page_index:
+                    out.insert_pdf(src, from_page=i, to_page=i)
+                    continue
+
+                pg = src[i]
+                pw, ph = pg.rect.width, pg.rect.height
+
+                x0 = keep[0] * pw
+                y0 = keep[1] * ph
+                x1 = keep[2] * pw
+                y1 = keep[3] * ph
+                clip_rect = fitz.Rect(x0, y0, x1, y1)
+                nw, nh = clip_rect.width, clip_rect.height
+
+                if nw <= 0 or nh <= 0:
+                    raise HTTPException(status_code=400, detail="Crop rectangle has zero area")
+
+                new_page = out.new_page(width=nw, height=nh)
+                new_page.show_pdf_page(
+                    fitz.Rect(0, 0, nw, nh),
+                    src, i,
+                    clip=clip_rect,
+                    keep_proportion=False,
+                )
+
+            tmp_path = f"{src_path}.tmp"
+            out.save(tmp_path)
+        finally:
+            out.close()
+
+        src.close()
+        os.replace(tmp_path, src_path)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Crop failed: {exc}") from exc
+    finally:
+        try:
+            src.close()
+        except Exception:
+            pass
+
+    meta["size"] = os.path.getsize(src_path)
+    file_registry[request.file_id] = meta
+    return {k: v for k, v in meta.items() if k != "path"}
 
 
 @app.get("/api/files")
@@ -106,6 +282,7 @@ async def list_files():
     return [
         {k: v for k, v in meta.items() if k != "path"}
         for meta in file_registry.values()
+        if meta.get("origin", "upload") == "upload"
     ]
 
 
@@ -151,8 +328,8 @@ async def get_thumbnail(file_id: str, page: int = 0, width: int = 200):
     return Response(
         content=png_bytes,
         media_type="image/png",
-        # Allow browser/CDN caching for 1 hour; file content is immutable per file_id+page
-        headers={"Cache-Control": "public, max-age=3600"},
+        # This server can mutate PDFs in place (e.g. rotate/mirror), so thumbnails must not be cached.
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -269,6 +446,7 @@ async def merge_pages(request: MergePagesRequest):
         "page_count": page_count,
         "size": size,
         "path": file_path,
+        "origin": "derived",
     }
     file_registry[file_id] = metadata
 

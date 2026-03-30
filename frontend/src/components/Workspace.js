@@ -1,13 +1,17 @@
-import { ArrowDownToLine, FileText, GitMerge } from "lucide-react";
+import { ArrowDownToLine, FileText, GitMerge, X } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
 import WorkspaceCard from "./WorkspaceCard";
 
 export default function Workspace({
   files,
+  pageOrders,
   draggedFile,
   onDrop,
   onRemove,
   onPageClick,
+  pageTransformMode,
+  onTransformPage,
+  areaCropMode,
   selectedFileId,
   onSelectPanel,
   onDownload,
@@ -22,6 +26,9 @@ export default function Workspace({
   onMergePanels,
   onMovePageToPanel,
   onExtractPageToNewPanel,
+  onDeletePage,
+  activeToolLabel,
+  onDeactivateTool,
 }) {
   const [dragOverFile, setDragOverFile] = useState(false);
 
@@ -224,31 +231,43 @@ export default function Workspace({
     if (pageDragRef.current) return;
 
     const rect = info?.rect;
-    const start = {
+    const startX = Math.round(info.x);
+    const startY = Math.round(info.y);
+    const DRAG_THRESHOLD = 5;
+    let hasDragged = false;
+
+    const pendingInfo = {
       sourceFileId: info.fileId,
       pageIndex: info.pageIndex,
-      x: Math.round(info.x),
-      y: Math.round(info.y),
+      x: startX,
+      y: startY,
       offsetX: rect ? Math.round(info.x - rect.left) : 0,
       offsetY: rect ? Math.round(info.y - rect.top) : 0,
       w: rect ? Math.round(rect.width) : 240,
       h: rect ? Math.round(rect.height) : 160,
     };
 
-    pageDragRef.current = start;
-    setPageDrag(start);
+    // Use the ref as a concurrency lock only; don't show the ghost yet.
+    pageDragRef.current = pendingInfo;
     setPageDropTargetId(null);
     pageDropTargetIdRef.current = null;
-    lastPageCursorRef.current = { x: start.x, y: start.y };
+    lastPageCursorRef.current = { x: startX, y: startY };
 
     const prevUserSelect = document.body.style.userSelect;
-    document.body.style.userSelect = "none";
 
     const onMouseMove = (e) => {
       const current = pageDragRef.current;
       if (!current) return;
       const rx = Math.round(e.clientX);
       const ry = Math.round(e.clientY);
+
+      // Don't start the visual drag or track panels until threshold is exceeded.
+      if (!hasDragged) {
+        if (Math.abs(rx - startX) < DRAG_THRESHOLD && Math.abs(ry - startY) < DRAG_THRESHOLD) return;
+        hasDragged = true;
+        document.body.style.userSelect = "none";
+      }
+
       lastPageCursorRef.current = { x: rx, y: ry };
       const next = { ...current, x: rx, y: ry };
       pageDragRef.current = next;
@@ -269,18 +288,27 @@ export default function Workspace({
       if (pageDropTargetIdRef.current !== targetId) {
         pageDropTargetIdRef.current = targetId;
         setPageDropTargetId(targetId);
-        if (targetId) console.log("[page-drag] target panel detected:", targetId);
-        else console.log("[page-drag] extract mode");
       }
     };
 
     const onMouseUp = () => {
       const current = pageDragRef.current;
-      // Recompute from last cursor position to avoid missing the final hover.
+
+      cleanupPageMouseListenersRef.current?.();
+      pageDragRef.current = null;
+      setPageDrag(null);
+      setPageDropTargetId(null);
+      pageDropTargetIdRef.current = null;
+      document.body.style.userSelect = prevUserSelect;
+
+      // A mousedown + mouseup without moving past the threshold is just a click — do nothing.
+      if (!hasDragged || !current) return;
+
+      // Recompute drop target from last cursor position to avoid missing the final hover.
       const { x: rx, y: ry } = lastPageCursorRef.current;
       let targetId = null;
       for (const f of files) {
-        if (f.file_id === current?.sourceFileId) continue;
+        if (f.file_id === current.sourceFileId) continue;
         const el = panelElsRef.current[f.file_id];
         if (!el) continue;
         const r = el.getBoundingClientRect();
@@ -290,30 +318,13 @@ export default function Workspace({
         }
       }
 
-      cleanupPageMouseListenersRef.current?.();
-      pageDragRef.current = null;
-      setPageDrag(null);
-      setPageDropTargetId(null);
-      pageDropTargetIdRef.current = null;
-      document.body.style.userSelect = prevUserSelect;
-
-      if (!current) return;
       if (targetId) {
-        console.log("[page-drag] drop -> move", {
-          sourceFileId: current.sourceFileId,
-          pageIndex: current.pageIndex,
-          targetFileId: targetId,
-        });
         onMovePageToPanel?.({
           sourceFileId: current.sourceFileId,
           pageIndex: current.pageIndex,
           targetFileId: targetId,
         });
       } else {
-        console.log("[page-drag] drop -> extract", {
-          sourceFileId: current.sourceFileId,
-          pageIndex: current.pageIndex,
-        });
         onExtractPageToNewPanel?.({
           sourceFileId: current.sourceFileId,
           pageIndex: current.pageIndex,
@@ -436,6 +447,26 @@ export default function Workspace({
           </p>
         )}
       </header>
+
+      {/* ── Active tool strip ── */}
+      {activeToolLabel && (
+        <div className="flex-shrink-0 flex items-center justify-between gap-3
+          px-6 py-2 bg-apple-blue border-b border-blue-600">
+          <span className="text-[12px] font-medium text-white/90">
+            <span className="font-bold text-white">{activeToolLabel}</span> mode is active —
+            click any page to apply
+          </span>
+          <button
+            onClick={onDeactivateTool}
+            className="flex items-center gap-1.5 px-3 py-1 rounded-full
+              bg-white/20 hover:bg-white/30 text-white text-[11px] font-semibold
+              transition-colors duration-150 flex-shrink-0"
+          >
+            <X size={11} />
+            Stop using {activeToolLabel}
+          </button>
+        </div>
+      )}
 
       {/* ── Canvas ── */}
       <div
@@ -569,12 +600,16 @@ export default function Workspace({
                   <React.Fragment key={file.file_id}>
                     <WorkspaceCard
                       file={file}
+                      orderedPages={pageOrders?.[file.file_id] || null}
                       disablePageReorder={!!pageDrag}
                       onRemove={onRemove}
                       onPageClick={(pageIdx) => {
                         onSelectPanel(file.file_id);
                         onPageClick(file, pageIdx);
                       }}
+                      pageTransformMode={pageTransformMode}
+                      onTransformPage={onTransformPage}
+                      areaCropMode={areaCropMode}
                       isSelected={selectedFileId === file.file_id}
                       onSelect={() => onSelectPanel(file.file_id)}
                       cropMode={fileCropMode}
@@ -582,8 +617,9 @@ export default function Workspace({
                       onConfirmCrop={onConfirmCrop}
                       onCancelCrop={onCancelCrop}
                       onPageReorderChange={onPageReorderChange}
-                      isScissorsActive={scissorsFileId === file.file_id}
+                      isScissorsActive={!!scissorsFileId}
                       onDeactivateScissors={onDeactivateScissors}
+                      onDeletePage={onDeletePage}
                       onPanelDragStart={handlePanelDragStart}
                       onPanelDragMove={handlePanelDragMove}
                       onPanelDragEnd={handlePanelDragEnd}
@@ -604,62 +640,13 @@ export default function Workspace({
                       }}
                     />
 
-                  {index < displayFiles.length - 1 && (
-                    <div className="w-2 flex-shrink-0" />
-                  )}
-                </React.Fragment>
+                    {index < displayFiles.length - 1 && (
+                      <div className="w-2 flex-shrink-0" />
+                    )}
+                  </React.Fragment>
                 );
               })}
             </div>
-          </div>
-        )}
-
-        {draggingPanelId && dragPos && (
-          <div className="fixed inset-0 pointer-events-none z-[10000]">
-            {(() => {
-              const ghostFile = files.find((f) => f.file_id === draggingPanelId) || null;
-              if (!ghostFile) return null;
-              return (
-                <div
-                  style={{
-                    position: "fixed",
-                    left: Math.round(dragPos.x - dragPos.offsetX),
-                    top: Math.round(dragPos.y - dragPos.offsetY),
-                    width: dragPos.w,
-                    height: dragPos.h,
-                    transform: "translate3d(0px, 0px, 0px)",
-                    backfaceVisibility: "hidden",
-                    willChange: "transform",
-                    imageRendering: "auto",
-                    boxShadow: "0 24px 60px rgba(0,0,0,0.28)",
-                  }}
-                >
-                  <WorkspaceCard
-                    file={ghostFile}
-                    disablePageReorder={!!pageDrag}
-                    onRemove={() => {}}
-                    onPageClick={() => {}}
-                    isSelected={false}
-                    onSelect={() => {}}
-                    cropMode={null}
-                    onTogglePageMark={() => {}}
-                    onConfirmCrop={() => {}}
-                    onCancelCrop={() => {}}
-                    onPageReorderChange={() => {}}
-                    isScissorsActive={false}
-                    onDeactivateScissors={() => {}}
-                    onPanelDragStart={() => {}}
-                    onPanelDragMove={() => {}}
-                    onPanelDragEnd={() => {}}
-                    isDragging={false}
-                    onDragOverPanel={() => {}}
-                    dragStyle={null}
-                    onRegisterPanelEl={() => {}}
-                    disablePanelDrag
-                  />
-                </div>
-              );
-            })()}
           </div>
         )}
 

@@ -11,10 +11,13 @@ import { BACKEND_BASE_URL } from "../api";
  */
 function PageThumbnail({
   fileId,
-  pageIdx,
-  displayIdx,
+  pageIdx,        // original page index — used only for the thumbnail URL
+  displayIdx,     // current position in the ordered list — used for the badge
   totalPages,
   onPageClick,
+  pageTransformMode,
+  onTransformPage,
+  areaCropMode,
   isCropMode,
   isMarked,
   onToggleMark,
@@ -26,21 +29,27 @@ function PageThumbnail({
   onExternalDragStart,
   isBeingDragged,
   onRegisterEl,
+  thumbVersion,
 }) {
   const [thumbErr, setThumbErr] = useState(false);
   const outerRef = useRef(null);
 
   const snappedWidth = Math.max(280, Math.round(thumbnailWidth / 50) * 50);
   const thumbnailUrl =
-    `${BACKEND_BASE_URL}/api/files/${fileId}/thumbnail?page=${pageIdx}&width=${snappedWidth}`;
+    `${BACKEND_BASE_URL}/api/files/${fileId}/thumbnail?page=${pageIdx}&width=${snappedWidth}${thumbVersion ? `&v=${thumbVersion}` : ''}`;
 
   const handleClick = (e) => {
     if (isScissorsMode) { e.stopPropagation(); onCutPage(pageIdx); return; }
-    if (isCropMode) onToggleMark(pageIdx);
+    if (isCropMode) { onToggleMark(pageIdx); return; }
+    if (areaCropMode) { e.stopPropagation(); onPageClick(pageIdx); return; }
+    if (pageTransformMode) {
+      e.stopPropagation();
+      onTransformPage?.({ fileId, pageIndex: pageIdx, transform: pageTransformMode });
+    }
   };
 
   const handleDoubleClick = () => {
-    if (!isCropMode && !isScissorsMode) onPageClick(pageIdx);
+    if (!isCropMode && !isScissorsMode && !pageTransformMode && !areaCropMode) onPageClick(pageIdx);
   };
 
   return (
@@ -53,7 +62,7 @@ function PageThumbnail({
       onDoubleClick={handleDoubleClick}
       onMouseDown={(e) => {
         // Only start drag in normal mode, on left button, not from inner buttons
-        if (isCropMode || isScissorsMode) return;
+        if (isCropMode || isScissorsMode || pageTransformMode || areaCropMode) return;
         if (e.button !== 0) return;
         if (e.target.closest("button")) return;
         e.preventDefault();
@@ -75,7 +84,9 @@ function PageThumbnail({
               ? isMarked
                 ? "border-red-500 cursor-pointer"
                 : "border-transparent hover:border-red-300 cursor-pointer"
-              : "border-transparent hover:border-apple-blue/50 cursor-grab active:cursor-grabbing hover:shadow-[0_3px_14px_rgba(0,113,227,0.18)]"
+              : areaCropMode
+                ? "border-transparent hover:border-blue-400 cursor-pointer hover:shadow-[0_3px_14px_rgba(59,130,246,0.22)]"
+                : "border-transparent hover:border-apple-blue/50 cursor-grab active:cursor-grabbing hover:shadow-[0_3px_14px_rgba(0,113,227,0.18)]"
         }`}
       title={
         isBeingDragged
@@ -84,7 +95,9 @@ function PageThumbnail({
             ? `Cut page ${displayIdx + 1}`
             : isCropMode
               ? isMarked ? "Click to unmark" : "Click to mark for deletion"
-              : `Page ${displayIdx + 1} — drag to move · double-click to view`
+              : areaCropMode
+                  ? `Page ${displayIdx + 1} — click to open for area crop`
+                  : `Page ${displayIdx + 1} — drag to move · double-click to view`
       }
     >
       <div className="bg-gray-100 flex items-center justify-center min-h-[130px]">
@@ -162,8 +175,13 @@ function PageThumbnail({
 
 export default function WorkspaceCard({
   file,
+  orderedPages,
+  disablePageReorder,
   onRemove,
   onPageClick,
+  pageTransformMode,
+  onTransformPage,
+  areaCropMode,
   isSelected,
   onSelect,
   cropMode,
@@ -173,6 +191,7 @@ export default function WorkspaceCard({
   onPageReorderChange,
   isScissorsActive,
   onDeactivateScissors,
+  onDeletePage,
   onPanelDragStart,
   onPanelDragMove,
   onPanelDragEnd,
@@ -220,8 +239,7 @@ export default function WorkspaceCard({
   }, [isScissorsActive, cutConfirmPage]);
 
   const commitCutPage = (originalPageIdx) => {
-    const next = pageOrder.filter((p) => p.originalPage !== originalPageIdx);
-    onPageReorderChange?.(file.file_id, next.map((p) => p.originalPage));
+    onDeletePage?.({ fileId: file.file_id, pageIndex: originalPageIdx });
   };
 
   const handleCutPage = (originalPageIdx, opts) => {
@@ -418,6 +436,9 @@ export default function WorkspaceCard({
               displayIdx={listIdx}
               totalPages={pageOrder.length}
               onPageClick={onPageClick}
+              pageTransformMode={pageTransformMode}
+              onTransformPage={onTransformPage}
+              areaCropMode={areaCropMode}
               isCropMode={!!cropMode}
               isMarked={cropMode?.markedPages.has(page.originalPage) ?? false}
               onToggleMark={onTogglePageMark}
@@ -427,6 +448,7 @@ export default function WorkspaceCard({
               isCutConfirmOpen={cutConfirmPage === page.originalPage}
               onCancelCut={() => setCutConfirmPage(null)}
               isBeingDragged={draggingPageIndex === page.originalPage}
+              thumbVersion={file._thumbV || 0}
               onRegisterEl={(el) => onRegisterPageEl?.(page.originalPage, el)}
               onExternalDragStart={({ rect, x, y }) => {
                 onExternalPageDragStart?.({
