@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
+  compressFile,
   cropPageLine,
   cropPages,
   deleteFile,
@@ -478,6 +479,31 @@ export default function App() {
     }
   }, [selectedFileId, workspaceFiles, addToast]);
 
+  // ── Compress selected file ────────────────────────────────────────────────────
+  const handleCompress = useCallback(async (level = "medium") => {
+    if (!selectedFileId) return;
+    try {
+      setLoading(true);
+      const stats = await compressFile(selectedFileId, level);
+      if (stats.savingsPercent > 0) {
+        const fmt = (n) =>
+          n >= 1_048_576
+            ? `${(n / 1_048_576).toFixed(1)} MB`
+            : `${Math.round(n / 1024)} KB`;
+        addToast(
+          `Compressed! ${fmt(stats.originalSize)} → ${fmt(stats.compressedSize)} (−${stats.savingsPercent}% saved)`,
+          "success",
+        );
+      } else {
+        addToast("File was already well-optimised — no further reduction possible.", "success");
+      }
+    } catch (err) {
+      addToast(err.message || "Failed to compress", "error");
+    } finally {
+      setLoading(false);
+    }
+  }, [selectedFileId, addToast]);
+
   // ── Page crop mode ───────────────────────────────────────────────────────────
   const handleActivatePageCrop = useCallback(() => {
     if (!selectedFileId) return;
@@ -586,6 +612,7 @@ export default function App() {
         selectedFileId={selectedFileId}
         onSelectPanel={handleSelectPanel}
         onDownload={handleDownload}
+        onCompress={handleCompress}
         pageCropMode={pageCropMode}
         onTogglePageMark={handleTogglePageMark}
         onConfirmCrop={handleConfirmCrop}

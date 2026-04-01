@@ -90,6 +90,25 @@ export async function downloadFile(fileId) {
   }
 }
 
+export async function compressFile(fileId, level = "medium") {
+  try {
+    const res = await api.get(`/api/files/${fileId}/compress`, {
+      params: { level },
+      responseType: "blob",
+    });
+    triggerDownload(res.data, res.headers["content-disposition"], "compressed.pdf");
+    // Return compression stats so the caller can surface them to the user.
+    return {
+      originalSize:    parseInt(res.headers["x-original-size"]    || "0", 10),
+      compressedSize:  parseInt(res.headers["x-compressed-size"]  || "0", 10),
+      savingsPercent:  parseFloat(res.headers["x-savings-percent"] || "0"),
+      method:          res.headers["x-compression-method"]        || "unknown",
+    };
+  } catch (err) {
+    throw new Error(await parseBlobError(err));
+  }
+}
+
 export async function cropPages(fileId, pagesToDelete) {
   try {
     const res = await api.post(

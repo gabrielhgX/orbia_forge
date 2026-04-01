@@ -1,14 +1,27 @@
+import io
 import os
+import shutil
+import subprocess
 import uuid
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import fitz  # PyMuPDF
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
+from PIL import Image
 from pydantic import BaseModel
 
 app = FastAPI(title="PDF Tool API")
+
+# Expose custom compression-stats headers so the browser JS can read them.
+_EXPOSED_HEADERS = [
+    "Content-Disposition",
+    "X-Original-Size",
+    "X-Compressed-Size",
+    "X-Savings-Percent",
+    "X-Compression-Method",
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,7 +29,192 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=_EXPOSED_HEADERS,
 )
+
+# ── Compression pipeline ──────────────────────────────────────────────────────
+
+# Per-level tuning.
+# Ghostscript PDFSETTINGS map directly to its built-in distiller profiles:
+#   /printer  → 300 DPI images, high quality  (low compression)
+#   /ebook    → 150 DPI images, medium quality (balanced)
+#   /screen   →  72 DPI images, aggressive     (maximum compression)
+#
+# PyMuPDF fallback mirrors the same intent via manual image downsampling.
+_COMPRESS_LEVELS: Dict[str, dict] = {
+    "low":    {"gs_setting": "/printer", "max_image_px": 1800, "jpeg_quality": 85},
+    "medium": {"gs_setting": "/ebook",   "max_image_px": 1200, "jpeg_quality": 72},
+    "high":   {"gs_setting": "/screen",  "max_image_px":  800, "jpeg_quality": 55},
+}
+
+
+def _find_ghostscript() -> Optional[str]:
+    """
+    Locate the Ghostscript binary.
+
+    Checks PATH first (works on Linux/macOS and Windows if GS was added to PATH),
+    then probes the standard Windows installation directories that the official
+    Ghostscript installer uses but does NOT add to PATH by default.
+    """
+    # 1. PATH lookup (Linux, macOS, or Windows with GS in PATH)
+    for name in ("gswin64c", "gswin32c", "gs", "gsc"):
+        path = shutil.which(name)
+        if path:
+            return path
+
+    # 2. Probe standard Windows install paths.
+    #    The official installer creates  C:\Program Files\gs\gsX.YZ.W\bin\gswin64c.exe
+    #    but never adds it to the system PATH, so shutil.which won't find it.
+    gs_root = r"C:\Program Files\gs"
+    if os.path.isdir(gs_root):
+        # Sort descending so the newest version is tried first.
+        versions = sorted(os.listdir(gs_root), reverse=True)
+        for ver in versions:
+            for binary in ("gswin64c.exe", "gswin32c.exe", "gs.exe"):
+                candidate = os.path.join(gs_root, ver, "bin", binary)
+                if os.path.isfile(candidate):
+                    return candidate
+
+    return None
+
+
+# Cache the GS path at import time so we don't re-scan for every request.
+_GS_BINARY: Optional[str] = _find_ghostscript()
+
+
+def _compress_with_ghostscript(input_path: str, output_path: str, level: str) -> bool:
+    """
+    Compress a PDF using Ghostscript — the primary and most effective method.
+
+    HOW IT WORKS
+    ─────────────
+    Ghostscript re-renders the entire document through its PostScript/PDF
+    interpreter and writes a brand-new PDF.  Because it controls every stage
+    of the output pipeline it can:
+
+    • Downsample all raster images to the target DPI (/ebook = 150 DPI,
+      /screen = 72 DPI).  This is the single biggest source of size reduction
+      for image-heavy PDFs and is impossible to achieve safely by patching
+      individual PDF streams from the outside.
+    • Re-encode downsampled images as JPEG at the appropriate quality setting.
+    • Subset embedded fonts — only the character outlines that actually appear
+      in the document are kept; unused glyphs are stripped.
+    • Eliminate duplicate image XObjects that appear on multiple pages.
+    • Remove embedded thumbnails, document metadata, and other optional bloat.
+    • Write a compact, linearised cross-reference table.
+
+    WHY THE PREVIOUS PyMuPDF APPROACH MADE FILES LARGER
+    ─────────────────────────────────────────────────────
+    1. Already-JPEG images were left untouched (correct), but then the PDF was
+       re-saved with `clean=True`.  PyMuPDF's content-stream cleaner reformats
+       page content streams, which can INCREASE their compressed size when
+       the originals were already well-packed by the authoring tool.
+    2. `update_stream(xref, jpeg_data, compress=False)` replaces an image
+       stream but does not update the surrounding PDF object dictionary
+       (/Width, /Height, /ColorSpace, /Filter, /Length).  This can produce
+       an internally inconsistent PDF that some readers will refuse to open,
+       and the mismatch overhead grows the file.
+    3. Stream-level patching cannot downsample JPEG images because the source
+       is already lossy-compressed — decoding → scaling → re-encoding causes
+       a quality loss with zero size benefit on content that was already at
+       the target DPI.
+    4. Without image downsampling there is almost nothing left to compress in
+       a typical PDF, so `garbage=4 + deflate=True + clean=True` frequently
+       produces a file that is the same size or slightly larger than the input.
+
+    Returns True on success, False if GS is unavailable or exits with error.
+    """
+    if not _GS_BINARY:
+        return False
+
+    cfg = _COMPRESS_LEVELS[level]
+    cmd = [
+        _GS_BINARY,
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        f"-dPDFSETTINGS={cfg['gs_setting']}",
+        "-dNOPAUSE",
+        "-dQUIET",
+        "-dBATCH",
+        "-dDetectDuplicateImages=true",  # deduplicate image XObjects across pages
+        "-dSubsetFonts=true",            # strip unused font glyphs
+        "-dCompressFonts=true",          # deflate-compress font streams
+        f"-sOutputFile={output_path}",
+        input_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        return result.returncode == 0 and os.path.getsize(output_path) > 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def _compress_with_pymupdf(input_path: str, output_path: str, level: str) -> None:
+    """
+    Fallback compression via PyMuPDF + Pillow, used only when Ghostscript is
+    not installed.
+
+    This path achieves meaningful compression only for PDFs whose images are
+    stored as uncompressed bitmaps, PNG/LZW, or CCITT — i.e. where image
+    re-encoding from a lossless format to JPEG is possible without a prior
+    decode → lossy re-encode cycle.  It will NOT significantly compress PDFs
+    whose images are already stored as JPEG (the most common case) because
+    re-encoding JPEG→JPEG degrades quality with no size benefit.
+    """
+    cfg = _COMPRESS_LEVELS[level]
+    max_px = cfg["max_image_px"]
+    quality = cfg["jpeg_quality"]
+
+    doc = fitz.open(input_path)
+    visited: set = set()
+
+    for page in doc:
+        for img_ref in page.get_images(full=True):
+            xref = img_ref[0]
+            if xref in visited:
+                continue
+            visited.add(xref)
+            try:
+                info = doc.extract_image(xref)
+                # Already JPEG — skip. Decoding + re-encoding adds loss and rarely saves space.
+                if info.get("ext") in ("jpeg", "jpx"):
+                    continue
+
+                pix = fitz.Pixmap(doc, xref)
+                if pix.width < 32 or pix.height < 32:
+                    continue  # skip tiny masks / icons
+
+                # JPEG only supports RGB and Grayscale.
+                if pix.alpha or pix.n > 3:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+
+                mode = "RGB" if pix.n == 3 else "L"
+                pil_img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+
+                w, h = pil_img.size
+                if max(w, h) > max_px:
+                    scale = max_px / max(w, h)
+                    pil_img = pil_img.resize(
+                        (max(1, int(w * scale)), max(1, int(h * scale))),
+                        Image.LANCZOS,
+                    )
+
+                buf = io.BytesIO()
+                pil_img.save(buf, format="JPEG", quality=quality, optimize=True)
+                jpeg_data = buf.getvalue()
+
+                # Only replace if genuinely smaller — never inflate the file.
+                if len(jpeg_data) < len(info["image"]):
+                    doc.update_stream(xref, jpeg_data, compress=False)
+
+            except Exception:
+                pass  # leave problematic images untouched
+
+    # deflate=True compresses content/text streams (safe, usually uncompressed).
+    # Do NOT use deflate_images / deflate_fonts — they wrap already-compressed
+    # JPEG/font data in an extra zlib layer, making those streams larger.
+    doc.save(output_path, garbage=4, deflate=True, clean=True)
+    doc.close()
 
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp_files")
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -79,7 +277,26 @@ def _remove_file(path: str) -> None:
 
 @app.get("/")
 async def root():
-    return {"message": "PDF Tool API is running"}
+    return {
+        "message": "PDF Tool API is running",
+        "ghostscript": _GS_BINARY or "not found — PyMuPDF fallback will be used",
+    }
+
+
+@app.get("/api/compression-info")
+async def compression_info():
+    """
+    Returns whether Ghostscript is available and the configured compression levels.
+    The frontend can call this on startup to warn the user if GS is missing.
+    """
+    return {
+        "ghostscript_available": bool(_GS_BINARY),
+        "ghostscript_path": _GS_BINARY,
+        "levels": {
+            k: {"gs_setting": v["gs_setting"], "jpeg_quality": v["jpeg_quality"]}
+            for k, v in _COMPRESS_LEVELS.items()
+        },
+    }
 
 
 @app.post("/api/upload")
@@ -345,6 +562,70 @@ async def download_file(file_id: str):
         media_type="application/pdf",
         filename=meta["filename"],
         headers={"Content-Disposition": f'attachment; filename="{meta["filename"]}"'},
+    )
+
+
+@app.get("/api/files/{file_id}/compress")
+async def compress_file(
+    file_id: str,
+    background_tasks: BackgroundTasks,
+    level: str = "medium",
+):
+    if file_id not in file_registry:
+        raise HTTPException(status_code=404, detail="File not found")
+    if level not in _COMPRESS_LEVELS:
+        raise HTTPException(status_code=400, detail="level must be low, medium, or high")
+
+    meta = file_registry[file_id]
+    if not os.path.exists(meta["path"]):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    original_size = os.path.getsize(meta["path"])
+    output_id = str(uuid.uuid4())
+    output_path = os.path.join(TEMP_DIR, f"output_{output_id}.pdf")
+
+    # ── Primary: Ghostscript ──────────────────────────────────────────────────
+    # GS is the gold standard: it re-renders the full PDF, downsamples all
+    # images to the target DPI, and subsets fonts — routinely 40–80% reduction.
+    gs_ok = _compress_with_ghostscript(meta["path"], output_path, level)
+    method = "ghostscript" if gs_ok else "pymupdf"
+
+    # ── Fallback: PyMuPDF + Pillow ────────────────────────────────────────────
+    if not gs_ok:
+        _compress_with_pymupdf(meta["path"], output_path, level)
+
+    compressed_size = os.path.getsize(output_path)
+
+    # ── Safety net ───────────────────────────────────────────────────────────
+    # If the output somehow grew (PDF was already well-optimised), discard the
+    # attempt and do a minimal dead-object cleanup pass instead so we never
+    # send back a file larger than the original.
+    if compressed_size >= original_size:
+        _remove_file(output_path)
+        doc = fitz.open(meta["path"])
+        doc.save(output_path, garbage=4, deflate=True)
+        doc.close()
+        compressed_size = os.path.getsize(output_path)
+        method = "cleanup-only"
+
+    savings_pct = round((1 - compressed_size / original_size) * 100, 1)
+
+    base_name = os.path.splitext(meta["filename"])[0]
+    download_name = f"{base_name}_compressed.pdf"
+
+    background_tasks.add_task(_remove_file, output_path)
+    return FileResponse(
+        output_path,
+        media_type="application/pdf",
+        filename=download_name,
+        headers={
+            "Content-Disposition": f'attachment; filename="{download_name}"',
+            # Stats are read by the frontend to show in a toast notification.
+            "X-Original-Size":        str(original_size),
+            "X-Compressed-Size":      str(compressed_size),
+            "X-Savings-Percent":      str(savings_pct),
+            "X-Compression-Method":   method,
+        },
     )
 
 

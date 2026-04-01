@@ -1,4 +1,4 @@
-import { ArrowDownToLine, FileText, GitMerge, X } from "lucide-react";
+import { ArrowDownToLine, ChevronDown, FileText, GitMerge, PackageOpen, X } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
 import WorkspaceCard from "./WorkspaceCard";
 
@@ -15,6 +15,7 @@ export default function Workspace({
   selectedFileId,
   onSelectPanel,
   onDownload,
+  onCompress,
   pageCropMode,
   onTogglePageMark,
   onConfirmCrop,
@@ -31,14 +32,31 @@ export default function Workspace({
   onDeactivateTool,
 }) {
   const [dragOverFile, setDragOverFile] = useState(false);
+  const [downloadMenuOpen, setDownloadMenuOpen] = useState(false);
+  const [compressExpanded, setCompressExpanded] = useState(false);
+  const downloadMenuRef = useRef(null);
 
-  // ── Page drag state (mouse-based, cross-PDF move / extract) ─────────────────
+  useEffect(() => {
+    if (!downloadMenuOpen) return;
+    const handleClickOutside = (e) => {
+      if (downloadMenuRef.current && !downloadMenuRef.current.contains(e.target)) {
+        setDownloadMenuOpen(false);
+        setCompressExpanded(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [downloadMenuOpen]);
+
+  // ── Page drag state (mouse-based, cross-PDF move / extract / within-panel reorder) ──
   const [pageDrag, setPageDrag] = useState(null);
   const pageDragRef = useRef(null);
   const [pageDropTargetId, setPageDropTargetId] = useState(null);
   const pageDropTargetIdRef = useRef(null);
   const lastPageCursorRef = useRef({ x: 0, y: 0 });
   const cleanupPageMouseListenersRef = useRef(null);
+  const [reorderInsertBefore, setReorderInsertBefore] = useState(null); // insert index within source panel
+  const pageElsRef = useRef({}); // { [fileId]: { [pageIndex]: HTMLElement } }
 
   // ── Panel drag state ───────────────────────────────────────────────────────
   const [draggingPanelId, setDraggingPanelId] = useState(null);
@@ -224,6 +242,21 @@ export default function Workspace({
     setMergeHoverPanelId(null);
   };
 
+  const computeInsertBefore = (fileId, draggingPageIdx, cursorY) => {
+    const pageEls = pageElsRef.current[fileId] || {};
+    const file = files.find((f) => f.file_id === fileId);
+    if (!file) return 0;
+    const pageOrder = file.pages || Array.from({ length: file.page_count }, (_, i) => i);
+    const others = pageOrder.filter((p) => p !== draggingPageIdx);
+    for (let i = 0; i < others.length; i++) {
+      const el = pageEls[others[i]];
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (cursorY < r.top + r.height / 2) return i;
+    }
+    return others.length;
+  };
+
   const handleExternalPageDragStart = (info) => {
     if (!info?.fileId || typeof info?.pageIndex !== "number") return;
     if (pendingMerge) return;
@@ -289,16 +322,33 @@ export default function Workspace({
         pageDropTargetIdRef.current = targetId;
         setPageDropTargetId(targetId);
       }
+
+      // When hovering over the source panel, compute insertion index for the reorder indicator.
+      if (!targetId) {
+        const sourceEl = panelElsRef.current[current.sourceFileId];
+        if (sourceEl) {
+          const r = sourceEl.getBoundingClientRect();
+          if (rx >= r.left && rx <= r.right && ry >= r.top && ry <= r.bottom) {
+            setReorderInsertBefore(computeInsertBefore(current.sourceFileId, current.pageIndex, ry));
+          } else {
+            setReorderInsertBefore(null);
+          }
+        }
+      } else {
+        setReorderInsertBefore(null);
+      }
     };
 
     const onMouseUp = () => {
       const current = pageDragRef.current;
+      const lastKnownTarget = pageDropTargetIdRef.current; // capture before reset
 
       cleanupPageMouseListenersRef.current?.();
       pageDragRef.current = null;
       setPageDrag(null);
       setPageDropTargetId(null);
       pageDropTargetIdRef.current = null;
+      setReorderInsertBefore(null);
       document.body.style.userSelect = prevUserSelect;
 
       // A mousedown + mouseup without moving past the threshold is just a click — do nothing.
@@ -306,6 +356,25 @@ export default function Workspace({
 
       // Recompute drop target from last cursor position to avoid missing the final hover.
       const { x: rx, y: ry } = lastPageCursorRef.current;
+
+      // First check if cursor is within the source panel → within-panel reorder.
+      const sourceEl = panelElsRef.current[current.sourceFileId];
+      if (sourceEl) {
+        const sr = sourceEl.getBoundingClientRect();
+        if (rx >= sr.left && rx <= sr.right && ry >= sr.top && ry <= sr.bottom) {
+          const file = files.find((f) => f.file_id === current.sourceFileId);
+          if (file) {
+            const pageOrder = file.pages || Array.from({ length: file.page_count }, (_, i) => i);
+            const others = pageOrder.filter((p) => p !== current.pageIndex);
+            const insertAt = computeInsertBefore(current.sourceFileId, current.pageIndex, ry);
+            const newOrder = [...others.slice(0, insertAt), current.pageIndex, ...others.slice(insertAt)];
+            onPageReorderChange?.(current.sourceFileId, newOrder);
+          }
+          return;
+        }
+      }
+
+      // Otherwise check for an external target panel.
       let targetId = null;
       for (const f of files) {
         if (f.file_id === current.sourceFileId) continue;
@@ -318,11 +387,14 @@ export default function Workspace({
         }
       }
 
-      if (targetId) {
+      // Fall back to last known hover target in case cursor drifted outside panel on mouseup.
+      const effectiveTarget = targetId || lastKnownTarget;
+
+      if (effectiveTarget) {
         onMovePageToPanel?.({
           sourceFileId: current.sourceFileId,
           pageIndex: current.pageIndex,
-          targetFileId: targetId,
+          targetFileId: effectiveTarget,
         });
       } else {
         onExtractPageToNewPanel?.({
@@ -426,19 +498,84 @@ export default function Workspace({
         </div>
 
         {selectedFile && (
-          <button
-            onClick={onDownload}
-            className="flex items-center gap-2 px-3.5 py-2 rounded-lg
-              bg-apple-blue hover:bg-blue-600 text-white text-[12px] font-semibold
-              transition-colors duration-150 shadow-sm active:scale-95"
-            title={`Download "${selectedFile.filename}"`}
-          >
-            <ArrowDownToLine size={13} />
-            Download
-            <span className="text-blue-200 font-normal truncate max-w-[140px]">
-              {selectedFile.filename}
-            </span>
-          </button>
+          <div className="relative" ref={downloadMenuRef}>
+            <button
+              onClick={() => setDownloadMenuOpen((o) => !o)}
+              className="flex items-center gap-2 px-3.5 py-2 rounded-lg
+                bg-apple-blue hover:bg-blue-600 text-white text-[12px] font-semibold
+                transition-colors duration-150 shadow-sm active:scale-95"
+              title={`Download options for "${selectedFile.filename}"`}
+            >
+              <ArrowDownToLine size={13} />
+              Download
+              <span className="text-blue-200 font-normal truncate max-w-[140px]">
+                {selectedFile.filename}
+              </span>
+              <ChevronDown size={11} className={`transition-transform duration-150 ${downloadMenuOpen ? "rotate-180" : ""}`} />
+            </button>
+
+            {downloadMenuOpen && (
+              <div className="absolute right-0 top-full mt-1.5 w-56 bg-white rounded-xl
+                shadow-[0_8px_30px_rgba(0,0,0,0.12)] border border-apple-border/60 overflow-hidden z-50">
+
+                {/* ── File Download ── */}
+                <button
+                  onClick={() => { setDownloadMenuOpen(false); setCompressExpanded(false); onDownload?.(); }}
+                  className="w-full flex items-center gap-3 px-4 py-3 text-[12px] font-medium
+                    text-apple-text hover:bg-apple-gray transition-colors text-left"
+                >
+                  <ArrowDownToLine size={13} className="text-apple-blue flex-shrink-0" />
+                  <span>File Download</span>
+                </button>
+
+                <div className="h-px bg-apple-border/40 mx-3" />
+
+                {/* ── File Compression (expandable) ── */}
+                <button
+                  onClick={() => setCompressExpanded((v) => !v)}
+                  className="w-full flex items-center gap-3 px-4 py-3 text-[12px] font-medium
+                    text-apple-text hover:bg-apple-gray transition-colors text-left"
+                >
+                  <PackageOpen size={13} className="text-violet-500 flex-shrink-0" />
+                  <span className="flex-1">File Compression</span>
+                  <ChevronDown
+                    size={11}
+                    className={`text-apple-secondary transition-transform duration-150
+                      ${compressExpanded ? "rotate-180" : ""}`}
+                  />
+                </button>
+
+                {/* ── Level picker (slides in) ── */}
+                {compressExpanded && (
+                  <div className="bg-apple-gray/60 border-t border-apple-border/40 px-3 py-2 flex flex-col gap-1">
+                    <p className="text-[10px] font-semibold text-apple-secondary uppercase tracking-wide px-1 mb-0.5">
+                      Quality
+                    </p>
+                    {[
+                      { id: "low",    label: "Low compression",    sub: "High quality · 300 DPI",    color: "text-emerald-600" },
+                      { id: "medium", label: "Medium compression",  sub: "Balanced · 150 DPI",        color: "text-amber-600"  },
+                      { id: "high",   label: "High compression",    sub: "Max savings · 72 DPI",      color: "text-red-500"    },
+                    ].map(({ id, label, sub, color }) => (
+                      <button
+                        key={id}
+                        onClick={() => {
+                          setDownloadMenuOpen(false);
+                          setCompressExpanded(false);
+                          onCompress?.(id);
+                        }}
+                        className="w-full flex flex-col px-3 py-2 rounded-lg text-left
+                          hover:bg-white transition-colors border border-transparent
+                          hover:border-apple-border/40 hover:shadow-sm"
+                      >
+                        <span className={`text-[12px] font-semibold ${color}`}>{label}</span>
+                        <span className="text-[10px] text-apple-secondary mt-0.5">{sub}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         )}
 
         {!selectedFile && !isEmpty && (
@@ -634,6 +771,13 @@ export default function Workspace({
                         isMergeMode && draggingPanelId === file.file_id
                       }
                       isPageDropTarget={pageDropTargetId === file.file_id}
+                      draggingPageIndex={pageDrag?.sourceFileId === file.file_id ? pageDrag.pageIndex : undefined}
+                      reorderInsertBefore={pageDrag?.sourceFileId === file.file_id ? reorderInsertBefore : null}
+                      onRegisterPageEl={(pageIdx, el) => {
+                        if (!pageElsRef.current[file.file_id]) pageElsRef.current[file.file_id] = {};
+                        if (el) pageElsRef.current[file.file_id][pageIdx] = el;
+                        else delete pageElsRef.current[file.file_id][pageIdx];
+                      }}
                       onRegisterPanelEl={(el) => {
                         if (el) panelElsRef.current[file.file_id] = el;
                         else delete panelElsRef.current[file.file_id];
